@@ -1,0 +1,19 @@
+# Local data cache -- rebuilt by indycalc/sde_loader.py and indycalc/price_cache.py
+indycalc/data/
+
+# Logs
+*.log
+
+# Runtime state
+indycalc.pid
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/
