@@ -85,13 +85,26 @@ def load_sde(db_path: Path = DB_PATH) -> None:
         regions.columns = ["region_id", "region_name"]
         regions.to_sql("regions", conn, if_exists="replace", index=False)
 
-        print("Fetching mapSolarSystems.csv (highsec systems, for job-cost system picker) ...")
-        systems = _fetch_csv("mapSolarSystems")
-        systems = systems[systems["security"] >= 0.5][
+        print("Fetching mapSolarSystems.csv (all systems -- job-cost system picker isn't "
+              "restricted to highsec, since where you build is your own call) ...")
+        systems = _fetch_csv("mapSolarSystems")[
             ["solarSystemID", "solarSystemName", "regionID", "security"]
         ]
         systems.columns = ["system_id", "system_name", "region_id", "security"]
         systems.to_sql("solar_systems", conn, if_exists="replace", index=False)
+
+        print("Fetching mapSolarSystemJumps.csv (stargate connectivity, for jump-distance searches) ...")
+        jumps = _fetch_csv("mapSolarSystemJumps")[["fromSolarSystemID", "toSolarSystemID"]]
+        jumps.columns = ["from_system_id", "to_system_id"]
+        jumps.to_sql("system_jumps", conn, if_exists="replace", index=False)
+
+        print("Fetching staStations.csv (NPC station names/locations -- for naming stations "
+              "discovered near a trade hub, beyond the 5 hardcoded hub stations) ...")
+        stations = _fetch_csv("staStations")[
+            ["stationID", "stationName", "solarSystemID", "regionID"]
+        ]
+        stations.columns = ["station_id", "station_name", "solar_system_id", "region_id"]
+        stations.to_sql("stations", conn, if_exists="replace", index=False)
 
         print("Deriving ore tier table from ore_tiers.py ...")
         asteroid_group_ids = set(inv_groups[inv_groups["categoryID"] == ASTEROID_CATEGORY_ID]["groupID"])
@@ -133,6 +146,12 @@ def load_sde(db_path: Path = DB_PATH) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_activity_times_type ON activity_times(type_id, activity_id)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_system_jumps_from ON system_jumps(from_system_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stations_system ON stations(solar_system_id)"
+        )
         conn.commit()
 
         for table in [
@@ -145,6 +164,8 @@ def load_sde(db_path: Path = DB_PATH) -> None:
             "activity_times",
             "regions",
             "solar_systems",
+            "system_jumps",
+            "stations",
             "ore_tiers",
         ]:
             count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]

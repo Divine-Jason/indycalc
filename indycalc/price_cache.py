@@ -1,5 +1,5 @@
 """Multi-region ore price cache, refreshed on demand (never automatically) to
-avoid hammering Fuzzworks. One Fuzzworks aggregates call per highsec region
+avoid hammering Fuzzworks. One Fuzzworks aggregates call per trade hub region
 (all ore type IDs batched into that single call via the comma-separated
 `types` parameter) -- not one call per ore per region.
 
@@ -19,31 +19,6 @@ from indycalc import db
 from indycalc.sde_loader import DB_PATH
 
 AGGREGATES_URL = "https://market.fuzzwork.co.uk/aggregates/"
-
-# Regions that are (almost) entirely highsec. Resolved to region_id via the
-# `regions` table at refresh time rather than hardcoding IDs.
-HIGHSEC_REGION_NAMES = [
-    "The Forge",
-    "Domain",
-    "Sinq Laison",
-    "Heimatar",
-    "Metropolis",
-    "Lonetrek",
-    "Essence",
-    "Everyshore",
-    "Kador",
-    "Tash-Murkon",
-    "Genesis",
-    "Verge Vendor",
-    "The Citadel",
-    "Black Rise",
-    "Derelik",
-    "Devoid",
-    "Solitude",
-    "Kor-Azor",
-    "Khanid",
-    "Molden Heath",
-]
 
 # Standard mineral type IDs, fetched alongside ore prices so leftover
 # ("waste") minerals can be valued in ISK, not just quantity.
@@ -84,6 +59,17 @@ HUB_STATION_IDS: dict[str, int] = {
     "Hek": 60005686,
 }
 
+# The regions that contain a major trade hub -- this is the scope for
+# "cheapest overall" (region-wide, not restricted to the hub's own station,
+# so e.g. Perimeter's market still counts as part of The Forge/Jita's
+# region) and for the aggregate liquidity pre-filter. Deliberately not "all
+# ~19 highsec regions" (an earlier version of this tool searched all of
+# them) -- EVE's bulk-purchase liquidity is concentrated enough in these 5
+# that the other highsec regions added real scan latency (real per-order
+# ESI fetches, not a cheap batched call) for essentially no better prices in
+# practice.
+HUB_REGION_NAMES = list(dict.fromkeys(TRADE_HUBS.values()))
+
 _CHUNK_SIZE = 200  # generous headroom well under any practical URL length limit
 
 # A single troll/leftover sell order (e.g. 14 units listed at a fraction of a
@@ -118,11 +104,11 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _highsec_region_ids(conn: sqlite3.Connection) -> dict[int, str]:
-    placeholders = ",".join("?" for _ in HIGHSEC_REGION_NAMES)
+def _hub_region_ids(conn: sqlite3.Connection) -> dict[int, str]:
+    placeholders = ",".join("?" for _ in HUB_REGION_NAMES)
     rows = conn.execute(
         f"SELECT region_id, region_name FROM regions WHERE region_name IN ({placeholders})",
-        HIGHSEC_REGION_NAMES,
+        HUB_REGION_NAMES,
     ).fetchall()
     return {region_id: name for region_id, name in rows}
 
@@ -390,16 +376,17 @@ def get_or_fetch_multi_station_prices(
 
 
 def refresh_prices(db_path: Path = DB_PATH) -> int:
-    """Refresh cached sell prices for all ore + mineral types across highsec
-    regions. Returns the number of (region, type) price rows written.
+    """Refresh cached sell prices for all ore + mineral types across the 5
+    trade hub regions. Returns the number of (region, type) price rows
+    written.
     """
     conn = db.connect(db_path)
     try:
         _ensure_table(conn)
-        region_ids = _highsec_region_ids(conn)
+        region_ids = _hub_region_ids(conn)
         type_ids = _all_ore_type_ids(conn) + list(MINERAL_TYPE_IDS)
         if not region_ids:
-            raise RuntimeError("No highsec regions found in `regions` table -- run sde_loader first.")
+            raise RuntimeError("No trade hub regions found in `regions` table -- run sde_loader first.")
         if not type_ids:
             raise RuntimeError("No ore types found in `ore_tiers` table -- run sde_loader first.")
         return _fetch_and_store(conn, type_ids, region_ids)
@@ -422,7 +409,7 @@ def get_or_fetch_prices(
     conn = db.connect(db_path)
     try:
         _ensure_table(conn)
-        all_regions = _highsec_region_ids(conn)
+        all_regions = _hub_region_ids(conn)
         region_ids = (
             {rid: name for rid, name in all_regions.items() if name in region_names}
             if region_names
@@ -450,6 +437,75 @@ def get_or_fetch_prices(
     return best_prices(type_ids, db_path, region_names=region_names)
 
 
+def region_ids_for_names(region_names: list[str] | None, db_path: Path = DB_PATH) -> list[int]:
+    """region_id for each hub region matching `region_names` (or all 5 hub
+    regions if None -- this is what makes "cheapest overall" search only
+    the trade hub regions, not every highsec region). Used by order_book.py,
+    which fetches real per-order data from ESI -- scoped by region, not by
+    the aggregate endpoint's arbitrary region/station param -- so callers
+    need actual IDs, not just names."""
+    conn = db.connect(db_path)
+    try:
+        all_regions = _hub_region_ids(conn)
+        if region_names:
+            return [rid for rid, name in all_regions.items() if name in region_names]
+        return list(all_regions)
+    finally:
+        conn.close()
+
+
+def station_region_id(station_id: int, db_path: Path = DB_PATH) -> int | None:
+    """Which region a known hub station belongs to, via TRADE_HUBS -- needed
+    because ESI's real order-book fetch (order_book.py) is scoped by region,
+    then filtered down to a specific station's location_id client-side."""
+    hub_name = next((name for name, sid in HUB_STATION_IDS.items() if sid == station_id), None)
+    if hub_name is None:
+        return None
+    region_name = TRADE_HUBS.get(hub_name)
+    if region_name is None:
+        return None
+    conn = db.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT region_id FROM regions WHERE region_name = ?", (region_name,)
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def region_ids_for_stations(station_ids: list[int], db_path: Path = DB_PATH) -> list[int]:
+    """region_id for each of `station_ids`, via the `stations` table (any
+    NPC station, not just the 5 known hubs) -- used for combo searches
+    expanded beyond the hubs (see optimizer.best_station_combo)."""
+    if not station_ids:
+        return []
+    conn = db.connect(db_path)
+    try:
+        placeholders = ",".join("?" for _ in station_ids)
+        rows = conn.execute(
+            f"SELECT DISTINCT region_id FROM stations WHERE station_id IN ({placeholders})",
+            station_ids,
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+def region_names_for_ids(region_ids: list[int], db_path: Path = DB_PATH) -> list[str]:
+    if not region_ids:
+        return []
+    conn = db.connect(db_path)
+    try:
+        placeholders = ",".join("?" for _ in region_ids)
+        rows = conn.execute(
+            f"SELECT region_name FROM regions WHERE region_id IN ({placeholders})", region_ids
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
 def last_refreshed(db_path: Path = DB_PATH) -> float | None:
     conn = db.connect(db_path)
     try:
@@ -472,8 +528,8 @@ def best_prices(
     like a great "price" and derails the whole plan.
 
     Pass `region_names` (e.g. a single trade hub's region) to restrict the
-    search to those regions only, instead of scattering across all cached
-    highsec regions.
+    search to those regions only, instead of scattering across all 5 hub
+    regions.
     """
     conn = db.connect(db_path)
     try:

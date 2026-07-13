@@ -29,6 +29,7 @@ supplies (a UI input), not fetched here.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,8 +38,15 @@ import requests
 from indycalc import db, production_chain
 from indycalc.sde_loader import DB_PATH, MANUFACTURING_ACTIVITY_ID, REACTION_ACTIVITY_ID
 
+# True security >= this counts as highsec for game purposes (displays as
+# "0.5" after rounding at the boundary) -- used only for the "recommend a
+# cheap highsec build system" search below. The manual system search above
+# deliberately isn't restricted to this.
+HIGHSEC_SECURITY_THRESHOLD = 0.45
+
 ADJUSTED_PRICES_URL = "https://esi.evetech.net/latest/markets/prices/"
 INDUSTRY_SYSTEMS_URL = "https://esi.evetech.net/latest/industry/systems/"
+INDUSTRY_FACILITIES_URL = "https://esi.evetech.net/latest/industry/facilities/"
 
 SCC_SURCHARGE_PCT = 4.0  # flat, well-documented, applies to every job
 COPY_COST_FACTOR = 0.02  # per the copying formula above
@@ -65,12 +73,22 @@ def _ensure_tables(conn) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS industry_facility_systems (
+            system_id INTEGER PRIMARY KEY,
+            fetched_at REAL NOT NULL
+        )
+        """
+    )
     conn.commit()
 
 
-def refresh_industry_data(db_path: Path = DB_PATH) -> tuple[int, int]:
-    """Refresh adjusted prices + system cost indices from ESI (2 calls total,
-    both global/unfiltered). Returns (adjusted_price rows, cost_index rows)."""
+def refresh_industry_data(db_path: Path = DB_PATH) -> tuple[int, int, int]:
+    """Refresh adjusted prices, system cost indices, and which systems have a
+    public industry facility, all from ESI (3 calls total, all
+    global/unfiltered). Returns (adjusted_price rows, cost_index rows,
+    facility-system rows)."""
     conn = db.connect(db_path)
     try:
         _ensure_tables(conn)
@@ -112,7 +130,26 @@ def refresh_industry_data(db_path: Path = DB_PATH) -> tuple[int, int]:
         )
         conn.commit()
 
-        return len(price_rows), len(index_rows)
+        # /industry/facilities/ is the authoritative live list of stations
+        # that currently offer industry services -- solves two problems at
+        # once: (1) plenty of NPC stations don't offer manufacturing/
+        # research/reaction at all (never did, this isn't a recent change),
+        # so a system merely *having* a station isn't enough; (2) this
+        # endpoint only returns public facilities, so player-owned Upwell
+        # structures (which we have no way to know exist, are accessible,
+        # or are freeport) are automatically excluded rather than guessed at.
+        resp = requests.get(INDUSTRY_FACILITIES_URL, params={"datasource": "tranquility"}, timeout=30)
+        resp.raise_for_status()
+        facility_system_ids = {entry["solar_system_id"] for entry in resp.json()}
+        facility_rows = [(system_id, fetched_at) for system_id in facility_system_ids]
+        conn.execute("DELETE FROM industry_facility_systems")
+        conn.executemany(
+            "INSERT INTO industry_facility_systems (system_id, fetched_at) VALUES (?, ?)",
+            facility_rows,
+        )
+        conn.commit()
+
+        return len(price_rows), len(index_rows), len(facility_rows)
     finally:
         conn.close()
 
@@ -127,16 +164,112 @@ def last_refreshed(db_path: Path = DB_PATH) -> float | None:
         conn.close()
 
 
-def search_systems(query: str, db_path: Path = DB_PATH, limit: int = 25) -> list[tuple[int, str]]:
-    """Return [(system_id, system_name), ...] for highsec systems matching query."""
+def search_systems(query: str, db_path: Path = DB_PATH, limit: int = 25) -> list[tuple[int, str, float]]:
+    """Return [(system_id, system_name, security), ...] matching query --
+    every system (highsec, lowsec, null, and J-space/wormhole), not just
+    highsec. Where you build isn't restricted the way where you buy is; if
+    you're searching for a specific station/system by name you already know
+    what you're doing."""
     conn = db.connect(db_path)
     try:
         rows = conn.execute(
-            "SELECT system_id, system_name FROM solar_systems WHERE system_name LIKE ? "
+            "SELECT system_id, system_name, security FROM solar_systems WHERE system_name LIKE ? "
             "ORDER BY system_name LIMIT ?",
             (f"%{query}%", limit),
         ).fetchall()
-        return [(int(r[0]), r[1]) for r in rows]
+        return [(int(r[0]), r[1], float(r[2])) for r in rows]
+    finally:
+        conn.close()
+
+
+@dataclass
+class SystemRecommendation:
+    system_id: int
+    system_name: str
+    jumps: int
+    cost_index: float
+
+
+def recommend_build_systems(
+    activity: str,
+    from_system_id: int,
+    max_jumps: int | None = None,
+    top_n: int = 10,
+    db_path: Path = DB_PATH,
+) -> list[SystemRecommendation]:
+    """The `top_n` highsec systems with the lowest cost index for `activity`
+    ("manufacturing" or "reaction"), each tagged with its jump distance from
+    `from_system_id` via a highsec-only route ("secure jumps" -- the same
+    routing autopilot's "safest" uses). A highsec system with no highsec-only
+    path from the start point (possible, if rare) is simply not included --
+    there's no meaningful "secure jump count" to show for it.
+
+    Restricted to systems with at least one public NPC station that
+    currently offers industry services (per ESI's /industry/facilities/,
+    refreshed alongside adjusted prices/cost indices) -- plenty of NPC
+    stations never offered manufacturing/research/reaction at all, so
+    merely having *a* station isn't enough. This also naturally excludes
+    player-owned Upwell structures, since that endpoint only returns public
+    facilities -- there's no way to know if one exists in a system, is
+    accessible, or is freeport, so it's not worth guessing at.
+
+    Deliberately restricted to highsec, unlike search_systems() -- this is a
+    "just recommend something safe and cheap" convenience, not a precise
+    tool, so it doesn't try to reason about low/null/J-space risk.
+    """
+    conn = db.connect(db_path)
+    try:
+        highsec_ids = {
+            row[0]
+            for row in conn.execute(
+                "SELECT system_id FROM solar_systems WHERE security >= ?",
+                (HIGHSEC_SECURITY_THRESHOLD,),
+            ).fetchall()
+        }
+        if from_system_id not in highsec_ids:
+            return []
+
+        facility_system_ids = {
+            row[0] for row in conn.execute("SELECT system_id FROM industry_facility_systems").fetchall()
+        }
+
+        edges = conn.execute("SELECT from_system_id, to_system_id FROM system_jumps").fetchall()
+        adjacency: dict[int, list[int]] = {}
+        for a, b in edges:
+            if a in highsec_ids and b in highsec_ids:
+                adjacency.setdefault(a, []).append(b)
+                adjacency.setdefault(b, []).append(a)
+
+        jumps_from_start: dict[int, int] = {from_system_id: 0}
+        queue: deque[int] = deque([from_system_id])
+        while queue:
+            current = queue.popleft()
+            if max_jumps is not None and jumps_from_start[current] >= max_jumps:
+                continue
+            for neighbor in adjacency.get(current, []):
+                if neighbor not in jumps_from_start:
+                    jumps_from_start[neighbor] = jumps_from_start[current] + 1
+                    queue.append(neighbor)
+
+        cost_rows = conn.execute(
+            "SELECT system_id, cost_index FROM system_cost_indices WHERE activity = ?",
+            (activity,),
+        ).fetchall()
+        names = {
+            row[0]: row[1]
+            for row in conn.execute("SELECT system_id, system_name FROM solar_systems").fetchall()
+        }
+
+        candidates = [
+            SystemRecommendation(system_id, names.get(system_id, str(system_id)), jumps_from_start[system_id], cost_index)
+            for system_id, cost_index in cost_rows
+            if system_id in jumps_from_start and system_id in facility_system_ids
+        ]
+        # Many systems tie at the cost index floor (barely-used industry
+        # slots) -- among ties, prefer the closer one, since "cheapest but
+        # 40 jumps away" isn't actually the more useful recommendation.
+        candidates.sort(key=lambda c: (c.cost_index, c.jumps))
+        return candidates[:top_n]
     finally:
         conn.close()
 
@@ -332,5 +465,8 @@ def estimate_build_time(
 
 
 if __name__ == "__main__":
-    n_prices, n_indices = refresh_industry_data()
-    print(f"Refreshed {n_prices} adjusted prices, {n_indices} system cost index rows.")
+    n_prices, n_indices, n_facilities = refresh_industry_data()
+    print(
+        f"Refreshed {n_prices} adjusted prices, {n_indices} system cost index rows, "
+        f"{n_facilities} systems with a public industry facility."
+    )

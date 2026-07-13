@@ -28,7 +28,7 @@ STEPS = [
      [sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")]),
     ("Downloading EVE static data (blueprints, ore, regions -- first time only, ~1-2 min)...",
      [sys.executable, "-m", "indycalc.sde_loader"]),
-    ("Fetching initial market prices across highsec regions...",
+    ("Fetching initial market prices across the 5 trade hub regions...",
      [sys.executable, "-m", "indycalc.price_cache"]),
 ]
 

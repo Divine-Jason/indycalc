@@ -149,14 +149,16 @@ with st.sidebar:
     runs = st.number_input("Runs", min_value=1, value=1, step=1)
 
     st.header("Where to buy")
-    buy_mode_options = ["Cheapest overall (scattered across regions)"] + list(price_cache.TRADE_HUBS)
+    buy_mode_options = ["Cheapest overall (scattered across hub regions)"] + list(price_cache.TRADE_HUBS)
     buy_mode = st.selectbox(
         "Buy from",
         options=buy_mode_options,
         help=(
-            "\"Cheapest overall\" picks the lowest-cost ore per material across all "
-            "cached highsec regions -- the absolute ISK minimum, but you may need to "
-            "collect ore from several different regions. Picking a single trade hub "
+            "\"Cheapest overall\" picks the lowest-cost ore per material across the 5 "
+            "regions that contain a major trade hub (still region-wide, not just each "
+            "hub's own station -- e.g. Perimeter's market counts as part of Jita's "
+            "region) -- the absolute ISK minimum within that scope, but you may need "
+            "to collect ore from several different regions. Picking a single trade hub "
             "buys everything from that one hub's region instead, trading some ISK "
             "for the convenience of one shopping trip -- still possibly several "
             "systems within that region, though. Check \"single station\" below for "
@@ -297,14 +299,21 @@ with st.sidebar:
     time_efficiency_pct = 0.0
     include_copy_cost = False
     if include_job_cost:
-        build_system_query = st.text_input("Build system search", value="Jita")
+        build_system_query = st.text_input(
+            "Build system search",
+            value="Jita",
+            help=(
+                "Any system -- highsec, lowsec, null, or J-space/wormhole. This is "
+                "just where the job runs, unrelated to \"Where to buy\" above."
+            ),
+        )
         system_matches = job_cost.search_systems(build_system_query) if build_system_query else []
         if system_matches:
-            system_labels = [name for _sid, name in system_matches]
+            system_labels = [f"{name} ({sec:.2f})" for _sid, name, sec in system_matches]
             build_system_selected = st.selectbox("Build system", options=range(len(system_matches)), format_func=lambda i: system_labels[i])
-            build_system_id, build_system_name = system_matches[build_system_selected]
+            build_system_id, build_system_name, _build_system_security = system_matches[build_system_selected]
         else:
-            st.warning("No highsec system matches that search.")
+            st.warning("No system matches that search.")
 
         facility_tax_pct = st.number_input(
             "Facility tax %", min_value=0.0, max_value=100.0, value=0.0, step=0.1,
@@ -336,20 +345,29 @@ with st.sidebar:
         else:
             st.caption("Industry data never refreshed yet")
         if st.button("Refresh Industry Data (adjusted prices + cost indices)"):
-            with st.spinner("Fetching adjusted prices and system cost indices from ESI..."):
-                n_prices, n_indices = job_cost.refresh_industry_data()
-            st.success(f"Refreshed {n_prices} adjusted prices, {n_indices} cost index rows.")
+            with st.spinner("Fetching adjusted prices, system cost indices, and industry facilities from ESI..."):
+                n_prices, n_indices, n_facilities = job_cost.refresh_industry_data()
+            st.success(
+                f"Refreshed {n_prices} adjusted prices, {n_indices} cost index rows, "
+                f"{n_facilities} systems with an industry facility."
+            )
             st.rerun()
 
     st.header("Market prices")
+    st.caption(
+        "Actual purchase costs come from real sell-order depth, fetched from ESI "
+        "per item and auto-refreshed hourly -- no button needed for that. This "
+        "refresh is just the cheap Fuzzworks liquidity scan used to decide which "
+        "ore/mineral candidates are even worth checking a real order book for."
+    )
     last_refresh = price_cache.last_refreshed()
     if last_refresh:
         age_min = (time.time() - last_refresh) / 60
         st.caption(f"Last refreshed {age_min:.0f} min ago")
     else:
         st.caption("Prices never refreshed yet")
-    if st.button("Refresh Prices (highsec regions)"):
-        with st.spinner("Fetching prices from Fuzzworks across highsec regions..."):
+    if st.button("Refresh Prices (trade hub regions)"):
+        with st.spinner("Fetching prices from Fuzzworks across the 5 trade hub regions..."):
             n = price_cache.refresh_prices()
         st.cache_data.clear()  # prices changed -- don't serve stale cached optimize() results
         st.success(f"Refreshed {n} region/ore price rows.")
@@ -459,55 +477,118 @@ if allow_build_components or allow_build_reactions:
     )
 
 st.subheader("Compare buying locations")
-comparison_df = cached_comparison_table(
-    required, refine_pct, ore_mode, allow_direct_minerals,
-    allow_build_components, allow_build_reactions,
-    component_me_percent, reaction_reduction_percent, expansion,
+st.caption(
+    "Prices come from real sell-order depth (not a single blended average), fetched "
+    "live from ESI per ore/mineral/component as needed -- this table runs 11 "
+    "independent checks (every hub's region and station, plus the unrestricted scan "
+    "across the 5 trade hub regions), so the first calculation for a given "
+    "blueprint/ME/runs combination can take anywhere from a few seconds to under a "
+    "minute depending on how many candidates need a fresh check. Cached after that, so "
+    "tweaking other options and clicking Recalculate is fast until you change the "
+    "blueprint, ME%, or runs."
 )
+with st.spinner("Checking real sell-order depth across regions/stations (first run only, then cached)..."):
+    comparison_df = cached_comparison_table(
+        required, refine_pct, ore_mode, allow_direct_minerals,
+        allow_build_components, allow_build_reactions,
+        component_me_percent, reaction_reduction_percent, expansion,
+    )
 st.dataframe(comparison_df, hide_index=True, width='stretch')
 
 combo_search = None
-if use_station_combo:
+is_cheapest_overall = buy_mode == buy_mode_options[0]
+show_combo_section = use_station_combo or is_cheapest_overall
+if show_combo_section:
     st.subheader(f"Best combo of up to {max_stations_combo} stations")
-    if st.button("Find best combo"):
-        with st.spinner(f"Searching combinations of up to {max_stations_combo} of the 5 hub stations..."):
-            best_combo, all_combo_results = cached_best_station_combo(
-                required,
-                refine_pct,
-                max_stations_combo,
-                ore_mode=ore_mode,
-                allow_direct_minerals=allow_direct_minerals,
-                allow_build_components=allow_build_components,
-                allow_build_reactions=allow_build_reactions,
-                component_me_percent=component_me_percent,
-                reaction_reduction_percent=reaction_reduction_percent,
-                pre_expanded=expansion,
-            )
-        st.session_state["combo_search"] = (best_combo, all_combo_results)
-    combo_search = st.session_state.get("combo_search")
-    if combo_search:
-        best_combo, all_combo_results = combo_search
-        if best_combo is None:
-            st.error(f"No combination of up to {max_stations_combo} stations covers every required item.")
-        else:
-            st.success(f"Best: {' + '.join(best_combo.station_names)} — {best_combo.result.total_cost:,.2f} ISK")
-            ranked = sorted(
-                all_combo_results,
-                key=lambda e: e.result.total_cost if not e.result.infeasible_reason else float("inf"),
-            )
-            combo_df = pd.DataFrame(
-                [
-                    {
-                        "Stations": " + ".join(e.station_names),
-                        "Total Cost (ISK)": round(e.result.total_cost, 2) if not e.result.infeasible_reason else None,
-                        "Status": "OK" if not e.result.infeasible_reason else "Missing coverage",
-                    }
-                    for e in ranked[:10]
-                ]
-            )
-            st.dataframe(combo_df, hide_index=True, width='stretch')
+    if is_cheapest_overall and not use_station_combo:
+        st.caption(
+            "Shown automatically because \"Cheapest overall\" is region-wide and doesn't "
+            "say where to actually go shopping -- this is the cheapest specific set of "
+            "stations to visit instead. It does not change the purchase plan below, "
+            "which still reflects the unrestricted scattered result; toggle \"Limit to "
+            "at most N stations\" in the sidebar to use this combo as the plan instead."
+        )
+    expand_near_hubs = st.checkbox(
+        "Expand search to include systems near trade hubs",
+        value=False,
+        help=(
+            f"Also considers highsec (>{optimizer.NEARBY_HUB_MIN_SECURITY:.0%} security) "
+            f"systems within {optimizer.NEARBY_HUB_MAX_JUMPS} jumps of a hub. A station "
+            f"there is only actually added as a candidate if real sell-order data shows "
+            f"it offers more than {optimizer.SIGNIFICANT_ISK_SHARE:.0%} of some required "
+            f"mineral's total ISK value at a price better than the 5-hub baseline "
+            f"(capped to the best {optimizer.MAX_DISCOVERED_STATIONS} such stations "
+            f"found, so the combo search itself doesn't explode)."
+        ),
+    )
+    with st.spinner(f"Searching combinations of up to {max_stations_combo} stations..."):
+        best_combo, all_combo_results = cached_best_station_combo(
+            required,
+            refine_pct,
+            max_stations_combo,
+            expand_near_hubs=expand_near_hubs,
+            ore_mode=ore_mode,
+            allow_direct_minerals=allow_direct_minerals,
+            allow_build_components=allow_build_components,
+            allow_build_reactions=allow_build_reactions,
+            component_me_percent=component_me_percent,
+            reaction_reduction_percent=reaction_reduction_percent,
+            pre_expanded=expansion,
+        )
+    combo_search = (best_combo, all_combo_results)
+
+    st.checkbox(
+        "Expand search to include all highsec systems -- warning: may take hours to calculate",
+        value=False,
+        key="expand_all_highsec_toggle",
+        help=(
+            "Same real-data check as above, but scans every highsec system in the game "
+            "instead of just those near a hub -- many more regions need a real "
+            "order-book check, which is what makes this slow. Only runs when you click "
+            "the button below, and only ever adds stations that clear the same "
+            f">{optimizer.SIGNIFICANT_ISK_SHARE:.0%}-of-ISK-value bar as above."
+        ),
+    )
+    if st.session_state.get("expand_all_highsec_toggle"):
+        if st.button("Run all-highsec search (may take hours)"):
+            with st.spinner("Scanning every highsec region for significant price advantages -- this can take a long time..."):
+                best_combo_all, all_combo_results_all = cached_best_station_combo(
+                    required,
+                    refine_pct,
+                    max_stations_combo,
+                    expand_all_highsec=True,
+                    ore_mode=ore_mode,
+                    allow_direct_minerals=allow_direct_minerals,
+                    allow_build_components=allow_build_components,
+                    allow_build_reactions=allow_build_reactions,
+                    component_me_percent=component_me_percent,
+                    reaction_reduction_percent=reaction_reduction_percent,
+                    pre_expanded=expansion,
+                )
+            st.session_state["combo_search_all_highsec"] = (best_combo_all, all_combo_results_all)
+        if st.session_state.get("combo_search_all_highsec"):
+            combo_search = st.session_state["combo_search_all_highsec"]
+
+    best_combo, all_combo_results = combo_search
+    if best_combo is None:
+        st.error(f"No combination of up to {max_stations_combo} stations covers every required item.")
     else:
-        st.info('Click "Find best combo" to search (takes a few seconds).')
+        st.success(f"Best: {' + '.join(best_combo.station_names)} — {best_combo.result.total_cost:,.2f} ISK")
+        ranked = sorted(
+            all_combo_results,
+            key=lambda e: e.result.total_cost if not e.result.infeasible_reason else float("inf"),
+        )
+        combo_df = pd.DataFrame(
+            [
+                {
+                    "Stations": " + ".join(e.station_names),
+                    "Total Cost (ISK)": round(e.result.total_cost, 2) if not e.result.infeasible_reason else None,
+                    "Status": "OK" if not e.result.infeasible_reason else "Missing coverage",
+                }
+                for e in ranked[:10]
+            ]
+        )
+        st.dataframe(combo_df, hide_index=True, width='stretch')
 
 if use_station_combo:
     if not combo_search or combo_search[0] is None:
@@ -515,20 +596,21 @@ if use_station_combo:
     result = combo_search[0].result
     plan_location = f"Best {len(combo_search[0].station_names)}-station combo: {' + '.join(combo_search[0].station_names)}"
 else:
-    result = cached_optimize(
-        required,
-        refine_pct,
-        region_names=selected_region_names,
-        station_id=selected_station_id,
-        station_label=selected_station_label,
-        ore_mode=ore_mode,
-        allow_direct_minerals=allow_direct_minerals,
-        allow_build_components=allow_build_components,
-        allow_build_reactions=allow_build_reactions,
-        component_me_percent=component_me_percent,
-        reaction_reduction_percent=reaction_reduction_percent,
-        pre_expanded=expansion,
-    )
+    with st.spinner("Building purchase plan from real sell-order depth..."):
+        result = cached_optimize(
+            required,
+            refine_pct,
+            region_names=selected_region_names,
+            station_id=selected_station_id,
+            station_label=selected_station_label,
+            ore_mode=ore_mode,
+            allow_direct_minerals=allow_direct_minerals,
+            allow_build_components=allow_build_components,
+            allow_build_reactions=allow_build_reactions,
+            component_me_percent=component_me_percent,
+            reaction_reduction_percent=reaction_reduction_percent,
+            pre_expanded=expansion,
+        )
     plan_location = f"{buy_mode} (single station)" if selected_station_id is not None else buy_mode
 
 if result.infeasible_reason:
@@ -543,13 +625,20 @@ st.subheader(f"Purchase plan — {plan_location}")
 
 if result.purchases:
     st.markdown("**Ore to buy and reprocess (or mineral to buy directly, when that's cheaper)**")
+    st.caption(
+        "Each row is one real sell-order price tier -- if a location's cheap orders "
+        "don't have enough depth to cover the full amount needed, the rest shows up "
+        "as its own row (a higher-priced tier at the same spot, or a different "
+        "ore/grade/location entirely), instead of assuming unlimited quantity at one "
+        "blended price."
+    )
     purchase_df = pd.DataFrame(
         [
             {
                 "Ore / Mineral": p.type_name,
                 "Tier": p.tier,
                 "Quantity": p.quantity,
-                "Cheapest Location": p.location_name,
+                "Location": p.location_name,
                 "Unit Price (ISK)": round(p.unit_price, 2),
                 "Cost (ISK)": round(p.cost, 2),
                 "Volume (m3)": round(p.volume_m3, 2),
@@ -563,15 +652,16 @@ if result.component_purchases:
     st.markdown("**Components / PI / reaction materials to buy directly**")
     st.caption(
         "These aren't ore-derived, so rather than modeling their own build chain "
-        "(reactions, PI, sub-components...) they're just priced at the cheapest "
-        "cached market sell price."
+        "(reactions, PI, sub-components...) they're just bought outright -- cheapest "
+        "real sell-order tier first, spilling into the next tier or location if one "
+        "spot doesn't have enough depth, same as ore above."
     )
     component_df = pd.DataFrame(
         [
             {
                 "Component": p.type_name,
                 "Quantity": p.quantity,
-                "Cheapest Location": p.location_name,
+                "Location": p.location_name,
                 "Unit Price (ISK)": round(p.unit_price, 2),
                 "Cost (ISK)": round(p.cost, 2),
                 "Volume (m3)": round(p.volume_m3, 2),
@@ -642,6 +732,46 @@ if include_job_cost and build_system_id is not None:
             "No adjusted-price/cost-index data for: " + ", ".join(missing_job_data)
             + " -- click \"Refresh Industry Data\" if you haven't yet."
         )
+
+    st.subheader("Find a cheaper highsec build system")
+    st.caption(
+        "Scans highsec systems that currently have a public NPC station offering "
+        "industry (not every station does, and player structures aren't guessable -- "
+        "so only real, usable options show up) and ranks the cheapest cost index, "
+        "tagged with jump distance from your build system above via a highsec-only "
+        "(\"secure\") route -- a system with no such route (rare) just won't appear. "
+        "Restricted to highsec since this is a \"recommend something safe\" "
+        "convenience; the search box above accepts any system, low/null/J-space "
+        "included, if you already know where you're going."
+    )
+    rec_col1, rec_col2, rec_col3 = st.columns([2, 1, 1])
+    rec_activity_label = rec_col1.selectbox("Rank by", options=["Manufacturing", "Reaction"], key="rec_activity")
+    rec_max_jumps = rec_col2.number_input("Max jumps (0 = no limit)", min_value=0, value=20, step=5, key="rec_max_jumps")
+    rec_col3.write("")  # vertical spacer to align the button with the inputs
+    rec_col3.write("")
+    if rec_col3.button("Find recommendations"):
+        rec_activity = "manufacturing" if rec_activity_label == "Manufacturing" else "reaction"
+        with st.spinner(f"Scanning highsec systems within {rec_max_jumps or 'any number of'} jumps..."):
+            recs = job_cost.recommend_build_systems(
+                rec_activity, build_system_id, max_jumps=rec_max_jumps or None, top_n=10
+            )
+        st.session_state["system_recs"] = (rec_activity_label, recs)
+    stored_recs = st.session_state.get("system_recs")
+    if stored_recs:
+        rec_label, recs = stored_recs
+        if not recs:
+            st.info("No highsec systems found within that jump range (or no cost-index data -- try Refresh Industry Data).")
+        else:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"System": r.system_name, "Jumps": r.jumps, f"{rec_label} Cost Index": round(r.cost_index, 4)}
+                        for r in recs
+                    ]
+                ),
+                hide_index=True,
+                width='stretch',
+            )
 
     if include_copy_cost:
         st.subheader("BPC copying cost")

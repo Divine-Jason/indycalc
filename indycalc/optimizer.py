@@ -1,5 +1,10 @@
 """Solve for the cheapest way to fill a blueprint's material list.
 
+Prices come from order_book.py's real per-order ESI data, not a single
+blended aggregate -- every candidate is priced in depth-capped tiers (see
+PriceSource below), so a plan can never assume more of something is
+available at a given price than actually is.
+
 Required materials fall into two buckets, handled differently:
   - The 8 standard minerals (Tritanium..Morphite) are ore-derived: solve a
     MILP for the cheapest combination of ore (across cached highsec regions)
@@ -9,24 +14,28 @@ Required materials fall into two buckets, handled differently:
     solution up to the nearest batch after the fact can massively overshoot
     cost when a candidate's fractional share was small but its batch size
     was large, and it makes a good-looking candidate a trap the solver keeps
-    picking blind to that trap.
+    picking blind to that trap. Each ore's price tiers are their own MILP
+    candidates too, so the solver can spend a thin order book's cheap end
+    and spill into the next tier or a different ore/grade entirely.
   - Everything else (Tech II components, PI materials, reaction intermediates,
     salvage, ...) has its own multi-step build chain that may or may not beat
     buying the finished item outright. Rather than modeling that whole tree,
-    these are just priced at the cheapest cached market sell price and added
-    to the total directly -- "buy the component."
+    these are just priced via a greedy cheapest-tier-first walk and added to
+    the total directly -- "buy the component."
 """
 from __future__ import annotations
 
 import itertools
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from scipy.optimize import Bounds, LinearConstraint, milp
 
-from indycalc import blueprint_calc, db, price_cache, production_chain
+from indycalc import blueprint_calc, db, order_book, price_cache, production_chain
+from indycalc.order_book import PriceTier
 from indycalc.price_cache import (
     MINERAL_TYPE_IDS,
     best_prices,
@@ -73,54 +82,129 @@ class ComponentPurchase:
 
 @dataclass
 class PriceSource:
-    """Abstracts "where do prices come from" so _optimize_ore/_price_components
-    don't need to know whether they're pricing across a region, a single
-    station, or several pooled stations -- same MILP either way, different
-    lookup. `label` is the uniform location shown for single-location
-    sources; a pooled multi-station source instead returns a per-item
-    "location_name" (which specific station in the pool was cheapest for
-    that item), which takes priority over `label` when present."""
+    """Abstracts "where do real order-book depth comes from" so
+    _optimize_ore/_price_components don't need to know whether they're
+    pricing across a region, a single station, or several pooled stations --
+    same candidate-generation either way, different lookup.
+
+    Real per-order data (order_book.py) comes from ESI, which is region-
+    scoped and expensive enough per (region, type) that it isn't worth
+    calling for every ore variant a blueprint could theoretically use --
+    most have no real liquidity at all. `prefilter_bulk`/`prefilter_any` are
+    price_cache.py's cheap, already-batched Fuzzworks aggregate lookups,
+    used only to narrow the candidate set down to items worth a real fetch;
+    the aggregate price itself is never used as a cost.
+
+    `location_filter=None` means region-wide (any station/structure in
+    `region_ids` counts, shown under the uniform `label`); a non-None set
+    restricts to those specific locations (single- or multi-station modes),
+    each displayed via `location_names` (falls back to `label` if unknown).
+    """
     label: str
-    bulk: Callable[[list[int]], dict[int, dict]]  # ore/mineral type_ids, pre-cached
-    any: Callable[[list[int]], dict[int, dict]]  # arbitrary type_ids, fetches on demand
+    region_ids: list[int]
+    location_filter: set[int] | None
+    prefilter_bulk: Callable[[list[int]], dict[int, dict]]
+    prefilter_any: Callable[[list[int]], dict[int, dict]]
+    location_names: dict[int, str] = field(default_factory=dict)
 
-    def bulk_prices(self, type_ids: list[int]) -> dict[int, dict]:
-        return {
-            tid: {"price": info["price"], "location_name": info.get("location_name", self.label)}
-            for tid, info in self.bulk(type_ids).items()
-        }
+    def location_name(self, location_id: int) -> str:
+        return self.location_names.get(location_id, self.label)
 
-    def any_prices(self, type_ids: list[int]) -> dict[int, dict]:
-        return {
-            tid: {"price": info["price"], "location_name": info.get("location_name", self.label)}
-            for tid, info in self.any(type_ids).items()
-        }
+    def bulk_tiers(self, type_ids: list[int]) -> dict[int, list[PriceTier]]:
+        allowed = self.prefilter_bulk(type_ids)
+        candidate_ids = [tid for tid in type_ids if tid in allowed]
+        if not candidate_ids:
+            return {}
+        return order_book.get_tiers(candidate_ids, self.region_ids, self.location_filter)
+
+    def any_tiers(self, type_ids: list[int]) -> dict[int, list[PriceTier]]:
+        allowed = self.prefilter_any(type_ids)
+        candidate_ids = [tid for tid in type_ids if tid in allowed]
+        if not candidate_ids:
+            return {}
+        return order_book.get_tiers(candidate_ids, self.region_ids, self.location_filter)
 
 
 def region_price_source(db_path: Path, region_names: list[str] | None) -> PriceSource:
     label = region_names[0] if region_names else "Cheapest overall"
     return PriceSource(
         label=label,
-        bulk=lambda ids: best_prices(ids, db_path, region_names=region_names),
-        any=lambda ids: get_or_fetch_prices(ids, db_path, region_names=region_names),
+        region_ids=price_cache.region_ids_for_names(region_names, db_path),
+        location_filter=None,
+        prefilter_bulk=lambda ids: best_prices(ids, db_path, region_names=region_names),
+        prefilter_any=lambda ids: get_or_fetch_prices(ids, db_path, region_names=region_names),
     )
 
 
 def station_price_source(db_path: Path, station_id: int, station_label: str) -> PriceSource:
+    region_id = price_cache.station_region_id(station_id, db_path)
     return PriceSource(
         label=station_label,
-        bulk=lambda ids: best_station_prices(ids, station_id, db_path),
-        any=lambda ids: get_or_fetch_station_prices(ids, station_id, db_path),
+        region_ids=[region_id] if region_id is not None else [],
+        location_filter={station_id},
+        prefilter_bulk=lambda ids: best_station_prices(ids, station_id, db_path),
+        prefilter_any=lambda ids: get_or_fetch_station_prices(ids, station_id, db_path),
+        location_names={station_id: station_label},
     )
 
 
-def multi_station_price_source(db_path: Path, station_ids: list[int]) -> PriceSource:
+def multi_station_price_source(
+    db_path: Path, station_ids: list[int], extra_station_names: dict[int, str] | None = None
+) -> PriceSource:
     """Pools several stations -- each item is priced at whichever station in
-    the list is cheapest for it, tagged with that specific station's name."""
+    the list is cheapest for it, tagged with that specific station's name.
+
+    Not restricted to the 5 known hubs -- also used for combo searches
+    expanded to include stations discovered near a hub or across highsec
+    (see best_station_combo's expand_* params); `extra_station_names`
+    supplies display names for those (they're not in HUB_STATION_IDS). For
+    a known hub, the ranking prefilter uses that station's own cached
+    aggregate (precise); for any other station, it falls back to that
+    station's *region*-level aggregate instead -- there's no per-station
+    Fuzzworks refresh for arbitrary stations, but region-level is still a
+    fine "worth a real check" signal, just slightly coarser.
+    """
+    known_hub_ids = set(price_cache.HUB_STATION_IDS.values())
+    hub_ids = [sid for sid in station_ids if sid in known_hub_ids]
+    other_ids = [sid for sid in station_ids if sid not in known_hub_ids]
+
+    station_names = {sid: name for name, sid in price_cache.HUB_STATION_IDS.items() if sid in hub_ids}
+    station_names.update({sid: name for sid, name in (extra_station_names or {}).items() if sid in other_ids})
+
+    other_region_ids = price_cache.region_ids_for_stations(other_ids, db_path)
+    other_region_names = price_cache.region_names_for_ids(other_region_ids, db_path)
+    region_ids = [
+        rid for rid in (price_cache.station_region_id(sid, db_path) for sid in hub_ids) if rid is not None
+    ] + other_region_ids
+
+    def _merge_cheapest(a: dict[int, dict], b: dict[int, dict]) -> dict[int, dict]:
+        merged = dict(a)
+        for tid, info in b.items():
+            if tid not in merged or info["price"] < merged[tid]["price"]:
+                merged[tid] = info
+        return merged
+
+    def prefilter_bulk(ids: list[int]) -> dict[int, dict]:
+        result = price_cache.best_multi_station_prices(ids, hub_ids, db_path) if hub_ids else {}
+        if other_region_names:
+            result = _merge_cheapest(result, price_cache.best_prices(ids, db_path, region_names=other_region_names))
+        return result
+
+    def prefilter_any(ids: list[int]) -> dict[int, dict]:
+        result = price_cache.get_or_fetch_multi_station_prices(ids, hub_ids, db_path) if hub_ids else {}
+        if other_region_names:
+            result = _merge_cheapest(
+                result, price_cache.get_or_fetch_prices(ids, db_path, region_names=other_region_names)
+            )
+        return result
+
     return PriceSource(
-        label="",  # unused: best_multi_station_prices always returns a per-item location_name
-        bulk=lambda ids: price_cache.best_multi_station_prices(ids, station_ids, db_path),
-        any=lambda ids: price_cache.get_or_fetch_multi_station_prices(ids, station_ids, db_path),
+        label="",  # unused: every tier is tagged with a specific station via location_names
+        region_ids=region_ids,
+        location_filter=set(station_ids),
+        prefilter_bulk=prefilter_bulk,
+        prefilter_any=prefilter_any,
+        location_names=station_names,
     )
 
 
@@ -189,6 +273,145 @@ def _load_yields(ore_type_ids: list[int], db_path: Path) -> dict[int, dict[int, 
         conn.close()
 
 
+# Real order-book depth-fetching is the expensive step (an ESI call per
+# (region, type) not yet cached), and eagerly fetching it for every ore
+# variant that could theoretically supply a required mineral wastes most of
+# that cost -- the MILP only ever ends up using a handful of the cheapest
+# ones. Instead, candidates are ranked per-mineral by the already-cached
+# aggregate price (no ESI call) and deep-fetched cheapest-first, in small
+# batches, stopping once every mineral has confirmed real depth comfortably
+# past what it needs. DEPTH_SAFETY_MARGIN is the buffer above the raw
+# requirement (depth toward one mineral doesn't help another, and portion-
+# size/batch rounding eats a little more) before a mineral is considered
+# "enough" and stops pulling in new candidates.
+DEPTH_SAFETY_MARGIN = 1.3
+MAX_EXPANSION_ROUNDS = 6
+CANDIDATES_PER_ROUND = 6  # new candidates considered per still-short mineral, per round
+
+
+@dataclass
+class _OreCandidate:
+    type_id: int
+    name: str
+    tier: str
+    portion_size: int
+    unit_volume: float
+    yield_row: dict[int, float]  # mineral_id -> yield per single ore/mineral unit, refine-adjusted
+
+
+def _build_virtual_candidates(
+    ores: list[tuple[int, str, str, int, float]],
+    base_yields: dict[int, dict[int, float]],
+    refine_pct: dict[str, float],
+    mineral_ids: list[int],
+    allow_direct_minerals: bool,
+    db_path: Path,
+) -> dict[int, _OreCandidate]:
+    """Every ore variant, plus (if allowed) a direct-buy pseudo-candidate per
+    mineral, in one pool keyed by type_id -- letting ranking/expansion/the
+    final MILP treat "buy the mineral directly" exactly like any other
+    candidate instead of special-casing it. A rare mineral (e.g. Morphite)
+    may only come from an expensive/thin ore (Mercoxit): reprocessing a
+    whole 100-unit portion just to cover a required qty of 1 can cost far
+    more than buying that 1 unit directly, so this lets the solver mix
+    strategies -- bulk ore for the big minerals, direct buy for a small
+    leftover amount of a rare one."""
+    candidates: dict[int, _OreCandidate] = {}
+    for type_id, name, tier, portion_size, unit_volume in ores:
+        pct = refine_pct.get(tier, 0.0) / 100.0
+        yield_row = {
+            mid: (base_yields.get(type_id, {}).get(mid, 0.0) / portion_size) * pct
+            for mid in mineral_ids
+        }
+        candidates[type_id] = _OreCandidate(type_id, name, tier, portion_size, unit_volume, yield_row)
+
+    if allow_direct_minerals:
+        mineral_names = blueprint_calc.material_names(mineral_ids, db_path)
+        mineral_volumes = blueprint_calc.material_volumes(mineral_ids, db_path)
+        for mid in mineral_ids:
+            candidates[mid] = _OreCandidate(
+                mid, mineral_names.get(mid, str(mid)), "Direct", 1,
+                mineral_volumes.get(mid, 0.0), {mid: 1.0},
+            )
+    return candidates
+
+
+def _rank_candidates_per_mineral(
+    virtual_candidates: dict[int, _OreCandidate], surface_prices: dict[int, dict], mineral_ids: list[int]
+) -> dict[int, list[int]]:
+    """Cheapest-estimated-cost-per-unit-of-mineral first, per mineral, using
+    only the cheap cached aggregate price (never a real order-book call)."""
+    ranked: dict[int, list[int]] = {}
+    for mineral_id in mineral_ids:
+        scored = []
+        for type_id, cand in virtual_candidates.items():
+            y = cand.yield_row.get(mineral_id, 0.0)
+            if y <= 0:
+                continue
+            price_info = surface_prices.get(type_id)
+            if price_info is None:
+                continue
+            scored.append((price_info["price"] / y, type_id))
+        scored.sort(key=lambda t: t[0])
+        ranked[mineral_id] = [tid for _, tid in scored]
+    return ranked
+
+
+# Row: (type_id, name, tier, portion_size, unit_price, yield_row, unit_volume, ub_batches, location_name)
+def _build_milp_candidates(
+    deep_fetched: set[int],
+    virtual_candidates: dict[int, _OreCandidate],
+    tiers_by_candidate: dict[int, list[PriceTier]],
+    price_source: PriceSource,
+) -> tuple[list[tuple], int]:
+    """One MILP candidate row per *price tier* of a deep-fetched ore/mineral,
+    not one per ore/mineral -- a thin order book (e.g. a single 26k-unit
+    sell order) can't fill an arbitrarily large purchase at that one price,
+    so each tier gets its own row capped to that tier's actual depth (in
+    whole batches). This lets the solver spend the cheap end of one ore's
+    book, spill into its next tier or a *different* ore/grade for the
+    remainder -- exactly the "Scordite II- vs III-Grade" substitution a
+    single blended price per candidate could never discover."""
+    rows: list[tuple] = []
+    fetched_with_tiers = 0
+    for type_id in deep_fetched:
+        cand = virtual_candidates[type_id]
+        tiers = tiers_by_candidate.get(type_id) or []
+        if not tiers:
+            continue
+        fetched_with_tiers += 1
+        for price_tier in tiers:
+            ub_batches = price_tier.max_qty // cand.portion_size
+            if ub_batches < 1:
+                continue
+            rows.append(
+                (
+                    cand.type_id, cand.name, cand.tier, cand.portion_size, price_tier.price,
+                    cand.yield_row, cand.unit_volume, ub_batches,
+                    price_source.location_name(price_tier.location_id),
+                )
+            )
+    return rows, fetched_with_tiers
+
+
+def _solve_ore_milp(candidates: list[tuple], mineral_ids: list[int], mineral_required: dict[int, int]):
+    # Decision variable per candidate is an integer *batch count* (one batch =
+    # one portion_size worth), not a continuous unit quantity -- see module
+    # docstring for why. cost/yield are expressed per batch accordingly, and
+    # each variable's upper bound is that tier's own depth in whole batches.
+    n = len(candidates)
+    m = len(mineral_ids)
+    cost_per_batch = [cand[4] * cand[3] for cand in candidates]  # unit_price * portion_size
+    yield_per_batch = [
+        [candidates[j][5].get(mineral_ids[i], 0.0) * candidates[j][3] for j in range(n)]
+        for i in range(m)
+    ]
+    required_vec = [mineral_required[mid] for mid in mineral_ids]
+    ub_vec = [cand[7] for cand in candidates]
+    constraints = LinearConstraint(yield_per_batch, lb=required_vec, ub=math.inf)
+    return milp(c=cost_per_batch, constraints=constraints, integrality=[1] * n, bounds=Bounds(lb=0, ub=ub_vec))
+
+
 def _optimize_ore(
     mineral_required: dict[int, int],
     refine_pct: dict[str, float],
@@ -197,7 +420,9 @@ def _optimize_ore(
     ore_mode: str,
     allow_direct_minerals: bool,
 ):
-    """Returns (purchases, total_cost, produced, infeasible_reason)."""
+    """Returns (purchases, total_cost, produced, infeasible_reason). See the
+    module-level constants above for the surface-price-guided deep-fetch
+    strategy this uses instead of eagerly fetching every candidate."""
     mineral_ids = sorted(mid for mid, qty in mineral_required.items() if qty > 0)
     if not mineral_ids:
         return [], 0.0, {}, None
@@ -209,106 +434,106 @@ def _optimize_ore(
 
     ore_type_ids = [o[0] for o in ores]
     base_yields = _load_yields(ore_type_ids, db_path)
-    ore_prices = price_source.bulk_prices(ore_type_ids)
-    # A rare mineral (e.g. Morphite) may only come from an expensive/thin ore
-    # (Mercoxit): reprocessing a whole 100-unit portion just to cover a
-    # required qty of 1 can cost vastly more than simply buying that 1 unit
-    # of the mineral on the market. Offer "buy the mineral directly" as a
-    # candidate alongside every ore so the solver picks whichever is cheaper --
-    # including a mix (bulk ore for the big minerals, direct buy for a small
-    # leftover amount of a rare one). Set allow_direct_minerals=False to force
-    # every mineral to come from ore reprocessing instead.
-
-    # Each candidate: (type_id, name, tier, portion_size, unit_price, yield_row, unit_volume)
-    candidates: list[tuple[int, str, str, int, float, dict[int, float], float]] = []
-    for type_id, name, tier, portion_size, unit_volume in ores:
-        price_info = ore_prices.get(type_id)
-        if price_info is None:
-            continue
-        pct = refine_pct.get(tier, 0.0) / 100.0
-        yield_row = {
-            mat_id: (base_yields.get(type_id, {}).get(mat_id, 0.0) / portion_size) * pct
-            for mat_id in mineral_ids
-        }
-        candidates.append(
-            (type_id, name, tier, portion_size, price_info["price"], yield_row, unit_volume)
-        )
-    n_ore_candidates = len(candidates)
-
-    if allow_direct_minerals:
-        mineral_direct_prices = price_source.bulk_prices(mineral_ids)
-        mineral_names = blueprint_calc.material_names(mineral_ids, db_path)
-        mineral_volumes = blueprint_calc.material_volumes(mineral_ids, db_path)
-        for mat_id in mineral_ids:
-            price_info = mineral_direct_prices.get(mat_id)
-            if price_info is None:
-                continue
-            candidates.append(
-                (
-                    mat_id,
-                    mineral_names.get(mat_id, str(mat_id)),
-                    "Direct",
-                    1,
-                    price_info["price"],
-                    {mat_id: 1.0},
-                    mineral_volumes.get(mat_id, 0.0),
-                )
-            )
-    else:
-        mineral_direct_prices = {}
-
-    missing = len(ores) - n_ore_candidates
-    if not candidates:
-        return [], 0.0, {}, f"No cached prices for any candidate ore or mineral in {price_source.label} -- click Refresh Prices first."
-
-    n = len(candidates)
-    m = len(mineral_ids)
-
-    # Decision variable per candidate is an integer *batch count* (one batch =
-    # one portion_size worth), not a continuous unit quantity -- see module
-    # docstring for why. cost/yield are expressed per batch accordingly.
-    cost_per_batch = [cand[4] * cand[3] for cand in candidates]  # unit_price * portion_size
-    yield_per_batch = [
-        [candidates[j][5].get(mineral_ids[i], 0.0) * candidates[j][3] for j in range(n)]
-        for i in range(m)
-    ]
-    required_vec = [mineral_required[mid] for mid in mineral_ids]
-
-    constraints = LinearConstraint(yield_per_batch, lb=required_vec, ub=math.inf)
-    res = milp(
-        c=cost_per_batch,
-        constraints=constraints,
-        integrality=[1] * n,
-        bounds=Bounds(lb=0, ub=math.inf),
+    virtual_candidates = _build_virtual_candidates(
+        ores, base_yields, refine_pct, mineral_ids, allow_direct_minerals, db_path
     )
 
+    surface_prices = price_source.prefilter_bulk(list(virtual_candidates))
+    ranked_by_mineral = _rank_candidates_per_mineral(virtual_candidates, surface_prices, mineral_ids)
+
+    deep_fetched: set[int] = set()
+    tiers_by_candidate: dict[int, list[PriceTier]] = {}
+    confirmed_depth: dict[int, float] = {mid: 0.0 for mid in mineral_ids}
+
+    def deep_fetch(type_ids) -> None:
+        fetched = price_source.bulk_tiers(list(type_ids))
+        for type_id in type_ids:
+            deep_fetched.add(type_id)
+            tiers = fetched.get(type_id) or []
+            tiers_by_candidate[type_id] = tiers
+            total_units = sum(t.max_qty for t in tiers)
+            for mineral_id, y in virtual_candidates[type_id].yield_row.items():
+                if y > 0:
+                    confirmed_depth[mineral_id] = confirmed_depth.get(mineral_id, 0.0) + total_units * y
+
+    def shortfall(mineral_id: int) -> float:
+        return mineral_required[mineral_id] * DEPTH_SAFETY_MARGIN - confirmed_depth.get(mineral_id, 0.0)
+
+    for _round in range(MAX_EXPANSION_ROUNDS):
+        short = [mid for mid in mineral_ids if shortfall(mid) > 0]
+        if not short:
+            break
+        batch: set[int] = set()
+        for mineral_id in short:
+            picked = 0
+            for type_id in ranked_by_mineral.get(mineral_id, []):
+                if type_id in deep_fetched or type_id in batch:
+                    continue
+                batch.add(type_id)
+                picked += 1
+                if picked >= CANDIDATES_PER_ROUND:
+                    break
+        if not batch:
+            break  # nothing left to try for any still-short mineral
+        deep_fetch(batch)
+
+    candidates, fetched_with_tiers = _build_milp_candidates(
+        deep_fetched, virtual_candidates, tiers_by_candidate, price_source
+    )
+    if not candidates:
+        return [], 0.0, {}, f"No real sell orders found for any candidate ore or mineral in {price_source.label} -- click Refresh Prices first."
+
+    res = _solve_ore_milp(candidates, mineral_ids, mineral_required)
+
+    if not res.success and len(deep_fetched) < len(virtual_candidates):
+        # The greedy margin didn't actually combine into a feasible batch
+        # allocation (can happen with awkward portion sizes/refine %, or a
+        # genuine shortage that only shows up once every option is on the
+        # table) -- fall back once to fetching everything remaining rather
+        # than reporting infeasible off an incomplete candidate set.
+        remaining = [tid for tid in virtual_candidates if tid not in deep_fetched]
+        deep_fetch(remaining)
+        candidates, fetched_with_tiers = _build_milp_candidates(
+            deep_fetched, virtual_candidates, tiers_by_candidate, price_source
+        )
+        res = _solve_ore_milp(candidates, mineral_ids, mineral_required)
+
     if not res.success:
+        missing = len(deep_fetched) - fetched_with_tiers
         reason = (
             "No feasible combination of ore/direct mineral purchases covers all "
-            "required minerals with the cached prices/refine % -- try lowering "
-            "refine % requirements or refreshing prices."
+            "required minerals with the real sell-order depth available and the "
+            "given refine % -- try lowering refine % requirements, allowing more "
+            "stations, or refreshing prices."
         )
         if missing:
-            reason += f" ({missing} candidate ore(s) had no cached price and were excluded.)"
+            reason += f" ({missing} candidate ore(s) had no real sell orders and were excluded.)"
         return [], 0.0, {}, reason
 
-    purchases: list[OrePurchase] = []
     produced: dict[int, float] = {mid: 0.0 for mid in mineral_ids}
     total_cost = 0.0
-    for j, (type_id, name, tier, portion_size, unit_price, yield_row, unit_volume) in enumerate(candidates):
+    # Multiple tiers of the same (type_id, location, price) can each get a
+    # nonzero batch count -- merge those into one purchase line rather than
+    # showing every tier separately when they land at the same price; a
+    # different price at the same location, or the same ore at a different
+    # location, still shows as its own line (see app.py, per the plan: no
+    # blending across genuinely different prices).
+    merged: dict[tuple, OrePurchase] = {}
+    for j, (type_id, name, tier, portion_size, unit_price, yield_row, unit_volume, ub_batches, location_name) in enumerate(candidates):
         batches = round(res.x[j])
         if batches < 1:
             continue
         qty = batches * portion_size
-        location_name = (
-            mineral_direct_prices[type_id]["location_name"]
-            if tier == "Direct"
-            else ore_prices[type_id]["location_name"]
-        )
         cost = qty * unit_price
         total_cost += cost
-        purchases.append(
-            OrePurchase(
+        key = (type_id, location_name, unit_price)
+        if key in merged:
+            existing = merged[key]
+            existing.quantity += qty
+            existing.cost += cost
+            existing.volume_m3 += qty * unit_volume
+        else:
+            merged[key] = OrePurchase(
                 type_id=type_id,
                 type_name=name,
                 tier=tier,
@@ -318,11 +543,11 @@ def _optimize_ore(
                 cost=cost,
                 volume_m3=qty * unit_volume,
             )
-        )
         for mat_id, per_unit in yield_row.items():
             produced[mat_id] = produced.get(mat_id, 0.0) + qty * per_unit
 
-    return sorted(purchases, key=lambda p: -p.cost), total_cost, produced, None
+    purchases = sorted(merged.values(), key=lambda p: -p.cost)
+    return purchases, total_cost, produced, None
 
 
 def _price_components(
@@ -330,35 +555,56 @@ def _price_components(
     db_path: Path,
     price_source: PriceSource,
 ) -> tuple[list[ComponentPurchase], dict[int, int]]:
+    """Components aren't batch-reprocessed, so unlike ore they don't compete
+    against each other for the same mineral requirement -- no MILP needed,
+    just a greedy walk that spends each item's cheapest tier first and
+    spills into the next until the required quantity is covered (or tiers
+    run out, which makes that item -- and the whole location -- infeasible,
+    same as an uncoverable mineral)."""
     component_ids = [tid for tid, qty in component_required.items() if qty > 0]
     if not component_ids:
         return [], {}
 
-    prices = price_source.any_prices(component_ids)
+    tiers_by_type = price_source.any_tiers(component_ids)
     names = blueprint_calc.material_names(component_ids, db_path)
     volumes = blueprint_calc.material_volumes(component_ids, db_path)
 
-    purchases: list[ComponentPurchase] = []
+    merged: dict[tuple, ComponentPurchase] = {}
     unpriced: dict[int, int] = {}
     for type_id in component_ids:
-        qty = component_required[type_id]
-        price_info = prices.get(type_id)
-        if price_info is None:
-            unpriced[type_id] = qty
+        remaining = component_required[type_id]
+        rows_this_type: list[tuple] = []
+        for price_tier in tiers_by_type.get(type_id) or []:
+            if remaining <= 0:
+                break
+            take = min(remaining, price_tier.max_qty)
+            if take <= 0:
+                continue
+            remaining -= take
+            rows_this_type.append((take, price_tier))
+        if remaining > 0:
+            unpriced[type_id] = component_required[type_id]
             continue
-        cost = qty * price_info["price"]
-        purchases.append(
-            ComponentPurchase(
-                type_id=type_id,
-                type_name=names.get(type_id, str(type_id)),
-                quantity=qty,
-                unit_price=price_info["price"],
-                location_name=price_info["location_name"],
-                cost=cost,
-                volume_m3=qty * volumes.get(type_id, 0.0),
-            )
-        )
-    return sorted(purchases, key=lambda p: -p.cost), unpriced
+        for take, price_tier in rows_this_type:
+            location_name = price_source.location_name(price_tier.location_id)
+            cost = take * price_tier.price
+            key = (type_id, location_name, price_tier.price)
+            if key in merged:
+                existing = merged[key]
+                existing.quantity += take
+                existing.cost += cost
+                existing.volume_m3 += take * volumes.get(type_id, 0.0)
+            else:
+                merged[key] = ComponentPurchase(
+                    type_id=type_id,
+                    type_name=names.get(type_id, str(type_id)),
+                    quantity=take,
+                    unit_price=price_tier.price,
+                    location_name=location_name,
+                    cost=cost,
+                    volume_m3=take * volumes.get(type_id, 0.0),
+                )
+    return sorted(merged.values(), key=lambda p: -p.cost), unpriced
 
 
 def optimize(
@@ -369,6 +615,7 @@ def optimize(
     station_id: int | None = None,
     station_label: str | None = None,
     station_ids: list[int] | None = None,
+    station_names: dict[int, str] | None = None,
     ore_mode: str = "any",
     allow_direct_minerals: bool = True,
     allow_build_components: bool = False,
@@ -391,7 +638,9 @@ def optimize(
     unless every required item is actually liquid there. Pass `station_ids`
     (a list) to pool several stations -- each item is priced at whichever of
     those stations is cheapest for it (see best_station_combo() for
-    searching which N-station combination is cheapest overall).
+    searching which N-station combination is cheapest overall). `station_names`
+    supplies display names for any of `station_ids` beyond the 5 known hubs
+    (used when best_station_combo() has expanded the search).
 
     `ore_mode` controls raw vs. compressed ore sourcing -- see ORE_MODES.
     `allow_direct_minerals=False` forces every mineral to come from ore
@@ -411,7 +660,7 @@ def optimize(
         raise ValueError(f"ore_mode must be one of {ORE_MODES}, got {ore_mode!r}")
 
     if station_ids is not None:
-        price_source = multi_station_price_source(db_path, station_ids)
+        price_source = multi_station_price_source(db_path, station_ids, station_names)
     elif station_id is not None:
         price_source = station_price_source(db_path, station_id, station_label or str(station_id))
     else:
@@ -506,6 +755,184 @@ def optimize_many(job_kwargs_list: list[dict]) -> list[OptimizationResult]:
     return [optimize(**kwargs) for kwargs in job_kwargs_list]
 
 
+# "Expand search" scope for best_station_combo(): how far from a hub counts
+# as "nearby" (jump-distance, highsec-only routing -- mirrors job_cost.py's
+# "secure jumps" pattern) and how good a discovered station has to be to be
+# worth adding as a combo candidate.
+NEARBY_HUB_MAX_JUMPS = 5
+NEARBY_HUB_MIN_SECURITY = 0.5
+SIGNIFICANT_ISK_SHARE = 0.10
+# Cap on extra (non-hub) stations added to the combo search -- otherwise a
+# generous discovery pass could make the C(n, k) combination count explode.
+MAX_DISCOVERED_STATIONS = 5
+# Cap on how many ore/mineral candidates per required mineral get a real
+# order-book check during discovery -- this search can span many more
+# regions than the standard 5-hub one, so it's capped by candidate count
+# (ranked cheapest-surface-price-first) rather than checking everything.
+MAX_DISCOVERY_CANDIDATES_PER_MINERAL = 8
+
+
+def _hub_system_ids(db_path: Path) -> list[int]:
+    conn = db.connect(db_path)
+    try:
+        placeholders = ",".join("?" for _ in price_cache.HUB_STATION_IDS)
+        rows = conn.execute(
+            f"SELECT solar_system_id FROM stations WHERE station_id IN ({placeholders})",
+            list(price_cache.HUB_STATION_IDS.values()),
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+def _systems_within_jumps(
+    start_system_ids: list[int], max_jumps: int | None, min_security: float, db_path: Path
+) -> set[int]:
+    """Multi-source BFS from `start_system_ids`, restricted to systems (and
+    the edges between them) with security > min_security -- mirrors
+    job_cost.recommend_build_systems()'s "secure jumps" pattern.
+    `max_jumps=None` means unbounded (every qualifying system, used for the
+    "all highsec" expansion rather than a jump-distance-limited one)."""
+    conn = db.connect(db_path)
+    try:
+        qualifying = {
+            row[0]
+            for row in conn.execute(
+                "SELECT system_id FROM solar_systems WHERE security > ?", (min_security,)
+            ).fetchall()
+        }
+        if max_jumps is None:
+            return qualifying
+
+        edges = conn.execute("SELECT from_system_id, to_system_id FROM system_jumps").fetchall()
+        adjacency: dict[int, list[int]] = {}
+        for a, b in edges:
+            if a in qualifying and b in qualifying:
+                adjacency.setdefault(a, []).append(b)
+                adjacency.setdefault(b, []).append(a)
+
+        jumps_from_start: dict[int, int] = {sid: 0 for sid in start_system_ids if sid in qualifying}
+        queue: deque[int] = deque(jumps_from_start)
+        while queue:
+            current = queue.popleft()
+            if jumps_from_start[current] >= max_jumps:
+                continue
+            for neighbor in adjacency.get(current, []):
+                if neighbor not in jumps_from_start:
+                    jumps_from_start[neighbor] = jumps_from_start[current] + 1
+                    queue.append(neighbor)
+        return set(jumps_from_start)
+    finally:
+        conn.close()
+
+
+def _stations_in_systems(system_ids: set[int], db_path: Path) -> dict[int, tuple[str, int]]:
+    """{station_id: (station_name, region_id)} for every NPC station in `system_ids`."""
+    if not system_ids:
+        return {}
+    conn = db.connect(db_path)
+    try:
+        placeholders = ",".join("?" for _ in system_ids)
+        rows = conn.execute(
+            f"SELECT station_id, station_name, region_id FROM stations WHERE solar_system_id IN ({placeholders})",
+            list(system_ids),
+        ).fetchall()
+        return {r[0]: (r[1], r[2]) for r in rows}
+    finally:
+        conn.close()
+
+
+@dataclass
+class DiscoveredStation:
+    station_id: int
+    name: str
+    isk_share: float  # largest single-mineral ISK share found, for ranking/capping
+
+
+def _discover_significant_stations(
+    required: dict[int, int],
+    refine_pct: dict[str, float],
+    db_path: Path,
+    ore_mode: str,
+    candidate_stations: dict[int, tuple[str, int]],
+) -> list[DiscoveredStation]:
+    """Real-data check: which of `candidate_stations` are worth adding to
+    the combo search -- offering more than SIGNIFICANT_ISK_SHARE of some
+    required mineral's total ISK value at a price better than the standard
+    5-hub baseline. This is the expensive step (real per-region ESI
+    fetches), scoped to just the regions the candidates are actually in --
+    the number of *distinct regions* those stations sit in, not the number
+    of stations, is what drives cost here."""
+    if not candidate_stations:
+        return []
+    mineral_ids = sorted(mid for mid, qty in required.items() if qty > 0 and mid in price_cache.MINERAL_TYPE_IDS)
+    if not mineral_ids:
+        return []
+
+    baseline = price_cache.best_multi_station_prices(
+        mineral_ids, list(price_cache.HUB_STATION_IDS.values()), db_path
+    )
+    baseline_prices = {mid: info["price"] for mid, info in baseline.items()}
+    if not baseline_prices:
+        return []
+
+    region_ids = sorted({region_id for _, region_id in candidate_stations.values()})
+    location_filter = set(candidate_stations)
+    region_names = price_cache.region_names_for_ids(region_ids, db_path)
+
+    ores = _load_relevant_ores(set(mineral_ids), db_path, ore_mode)
+    base_yields = _load_yields([o[0] for o in ores], db_path)
+    virtual_candidates = _build_virtual_candidates(ores, base_yields, refine_pct, mineral_ids, True, db_path)
+
+    # This can span many more regions than the standard 5-hub search (every
+    # region a nearby/highsec station happens to be in), so real fetches are
+    # capped to the top-ranked candidates per mineral -- same cheap-surface-
+    # price-first idea as _optimize_ore's lazy expansion, just a fixed cap
+    # instead of adaptive rounds, since "is anything here notably cheaper"
+    # doesn't need the same completeness guarantee as an actual purchase plan.
+    surface_prices = price_cache.get_or_fetch_prices(list(virtual_candidates), db_path, region_names=region_names)
+    ranked_by_mineral = _rank_candidates_per_mineral(virtual_candidates, surface_prices, mineral_ids)
+    to_check: set[int] = set()
+    for mineral_id in mineral_ids:
+        to_check.update(ranked_by_mineral.get(mineral_id, [])[:MAX_DISCOVERY_CANDIDATES_PER_MINERAL])
+
+    tiers = order_book.get_tiers(list(to_check), region_ids, location_filter, db_path)
+
+    # ISK value each station contributes toward each mineral, counting only
+    # depth priced *below* that mineral's 5-hub baseline (a station that's
+    # more expensive than the hubs isn't "significant," it's just present).
+    contribution: dict[int, dict[int, float]] = {}
+    for type_id, price_tiers in tiers.items():
+        cand = virtual_candidates[type_id]
+        for price_tier in price_tiers:
+            for mineral_id, y in cand.yield_row.items():
+                if y <= 0:
+                    continue
+                baseline_price = baseline_prices.get(mineral_id)
+                if baseline_price is None or price_tier.price >= baseline_price:
+                    continue
+                isk_value = price_tier.max_qty * y * price_tier.price
+                station_map = contribution.setdefault(price_tier.location_id, {})
+                station_map[mineral_id] = station_map.get(mineral_id, 0.0) + isk_value
+
+    discovered: list[DiscoveredStation] = []
+    for station_id, mineral_contribs in contribution.items():
+        if station_id not in candidate_stations:
+            continue  # a real order can sit at a location outside our candidate set
+        best_share = 0.0
+        for mineral_id, isk_value in mineral_contribs.items():
+            total_value = required[mineral_id] * baseline_prices.get(mineral_id, 0.0)
+            if total_value <= 0:
+                continue
+            best_share = max(best_share, isk_value / total_value)
+        if best_share > SIGNIFICANT_ISK_SHARE:
+            name, _ = candidate_stations[station_id]
+            discovered.append(DiscoveredStation(station_id, name, best_share))
+
+    discovered.sort(key=lambda d: -d.isk_share)
+    return discovered[:MAX_DISCOVERED_STATIONS]
+
+
 @dataclass
 class StationComboResult:
     station_names: tuple[str, ...]
@@ -517,28 +944,60 @@ def best_station_combo(
     refine_pct: dict[str, float],
     max_stations: int,
     db_path: Path = DB_PATH,
+    expand_near_hubs: bool = False,
+    expand_all_highsec: bool = False,
+    ore_mode: str = "any",
     **optimize_kwargs,
 ) -> tuple[StationComboResult | None, list[StationComboResult]]:
-    """Try every combination of up to `max_stations` of the 5 known hub
-    stations (small enough to brute-force: at most C(5,1)+...+C(5,5) = 31
-    combos, run in parallel via optimize_many) and return the cheapest
-    feasible one, plus every combo tried (for a "here's what we checked"
-    comparison table).
+    """Try every combination of up to `max_stations` of the candidate
+    stations (brute-force -- see below for why this stays small) and
+    return the cheapest feasible one, plus every combo tried (for a
+    "here's what we checked" comparison table).
 
-    Only the 5 major hub stations are candidates -- this tool doesn't have
-    station-level price data for anywhere else, and realistically those are
-    the only stations liquid enough for bulk purchases anyway.
+    By default, candidates are strictly the 5 known trade hub stations (at
+    most C(5,1)+...+C(5,5) = 31 combos) -- this tool doesn't have real
+    per-station data anywhere else without asking for it, and realistically
+    those are the only stations liquid enough for bulk purchases anyway.
+
+    `expand_near_hubs=True` also considers highsec (security > 0.5) systems
+    within NEARBY_HUB_MAX_JUMPS of a hub; `expand_all_highsec=True`
+    considers every highsec system in the game instead (can take a long
+    time -- many more regions need a real order-book check). In both cases,
+    a discovered station only actually gets added as a combo candidate if
+    it passes `_discover_significant_stations`' real-data check (offering
+    more than SIGNIFICANT_ISK_SHARE of some mineral's ISK value at a price
+    better than the 5-hub baseline), capped to MAX_DISCOVERED_STATIONS --
+    otherwise a generous discovery pass could make the combo count explode.
     """
-    hub_names = list(price_cache.HUB_STATION_IDS)
+    candidate_stations: dict[str, int] = dict(price_cache.HUB_STATION_IDS)
+
+    if expand_near_hubs or expand_all_highsec:
+        if expand_all_highsec:
+            system_ids = _systems_within_jumps([], None, NEARBY_HUB_MIN_SECURITY, db_path)
+        else:
+            system_ids = _systems_within_jumps(
+                _hub_system_ids(db_path), NEARBY_HUB_MAX_JUMPS, NEARBY_HUB_MIN_SECURITY, db_path
+            )
+        stations_in_range = _stations_in_systems(system_ids, db_path)
+        known_hub_ids = set(price_cache.HUB_STATION_IDS.values())
+        stations_in_range = {sid: info for sid, info in stations_in_range.items() if sid not in known_hub_ids}
+        for discovered in _discover_significant_stations(required, refine_pct, db_path, ore_mode, stations_in_range):
+            candidate_stations[discovered.name] = discovered.station_id
+
+    station_ids_by_name = candidate_stations
+    station_display_names = {sid: name for name, sid in candidate_stations.items()}
+    combo_names = list(candidate_stations)
     combos = [
-        combo for k in range(1, max_stations + 1) for combo in itertools.combinations(hub_names, k)
+        combo for k in range(1, max_stations + 1) for combo in itertools.combinations(combo_names, k)
     ]
     job_kwargs_list = [
         dict(
             required=required,
             refine_pct=refine_pct,
             db_path=db_path,
-            station_ids=[price_cache.HUB_STATION_IDS[name] for name in combo],
+            ore_mode=ore_mode,
+            station_ids=[station_ids_by_name[name] for name in combo],
+            station_names=station_display_names,
             **optimize_kwargs,
         )
         for combo in combos

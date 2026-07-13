@@ -77,8 +77,9 @@ no separate stop script to hunt down.
 | `indycalc/sde_loader.py` | Downloads EVE's Static Data Export (blueprints, ore, regions) from Fuzzwork and builds the local `sde.db` cache. Run manually (`python -m indycalc.sde_loader`) to refresh after a game update. |
 | `indycalc/ore_tiers.py` | Maps ore names to their reprocessing rig tier (Simple/Coherent/Variegated/Complex/Abyssal/Mercoxit/Erratic) and holds the default refine % shown in the UI. |
 | `indycalc/blueprint_calc.py` | Blueprint search, and the ME%/run-count math for required material quantities. |
-| `indycalc/price_cache.py` | Fetches and caches sell prices from Fuzzwork's market aggregates across highsec regions *and* the 5 major hub stations, on demand only. Also defines the 8 standard minerals, the 5 major trade hubs, and their station IDs. |
-| `indycalc/optimizer.py` | The actual optimization: a mixed-integer program that picks the cheapest combination of ore batches (and/or direct mineral purchases) to cover required minerals, plus market pricing for non-ore components -- from a region, a single station, or unrestricted. |
+| `indycalc/price_cache.py` | Fetches and caches sell prices from Fuzzwork's market aggregates across the 5 trade hub regions *and* their stations, on demand only. No longer the source of actual purchase costs (see `order_book.py`) -- now used as a cheap ranking/liquidity signal, deciding which ore/mineral candidates are worth a real order-book fetch and in what order. Also defines the 8 standard minerals, the 5 major trade hubs, and their station/region IDs. |
+| `indycalc/order_book.py` | Fetches the *real* sell-order book from ESI (not a blended average) for whichever candidates `optimizer.py` decides are worth checking, so the optimizer knows exactly how much is available at each price -- see "Depth-aware pricing" below. |
+| `indycalc/optimizer.py` | The actual optimization: a mixed-integer program that picks the cheapest combination of ore batches (and/or direct mineral purchases) to cover required minerals, plus market pricing for non-ore components -- from a region, a single station, or unrestricted. Every candidate is priced in real, depth-capped tiers from `order_book.py`, fetched lazily in cheapest-surface-price-first order -- see "Depth-aware pricing" below. |
 | `indycalc/production_chain.py` | Build-vs-buy: expands components/reaction materials into their own sub-materials when that's cheaper than buying them outright. See "Building your own components/reactions" below. |
 | `indycalc/job_cost.py` | Job installation fee, BPC copying cost, and build-time estimates -- pulls adjusted prices and system cost indices from ESI. See "Job installation cost, BPC copying, and build time" below. |
 | `indycalc/db.py` | Shared SQLite connection helper (WAL mode + busy timeout, so the app doesn't choke if two things touch the database at once). |
@@ -112,6 +113,56 @@ For each material a blueprint needs (after applying ME% and run count):
   region, or the unrestricted "cheapest overall" scan. Otherwise a station that simply
   doesn't sell some item would look artificially cheap (missing = free) and could get
   ranked as the best place to buy everything, when it's actually missing something.
+
+## Depth-aware pricing
+
+Every price the optimizer actually uses to build a purchase plan comes from **real sell
+orders** (fetched live from ESI, per item), not a single blended average price. This
+matters for bulk buying specifically: a market's headline "price" for an ore can be
+backed by very little actual depth -- e.g. one real case seen while building this tool,
+a specific ore grade at a hub station had over a million units advertised at one price
+in the aggregate feed, but the *cheap* end of that was really just one sell order for
+~26,000 units, with the rest sitting at a noticeably higher price. Pricing the whole
+purchase at the cheap blended number would have understated the true cost.
+
+Instead, each ore/mineral/component is priced in **tiers**: the cheapest real sell
+order(s) first, up to however many units are actually listed there, then the next
+cheapest tier for the remainder, and so on -- possibly spilling into a *different*
+ore/grade entirely once the cheap depth of the first one runs out (the purchase plan
+table shows each tier as its own row so you can see exactly what's bought where at what
+price, rather than one averaged number).
+
+**Not every candidate gets a real order-book check.** A blueprint's minerals can each
+come from dozens of ore variants, and checking all of them would mean an ESI call for
+each -- most of which the optimizer would never actually use. Instead, `price_cache.py`'s
+cheap Fuzzwork aggregate price (already cached, no extra ESI call) ranks candidates
+per-mineral, and the optimizer deep-fetches real order-book data cheapest-first, in
+small batches, stopping once every mineral has confirmed real depth comfortably past
+what it needs. This mirrors how a shopper actually buys: check the cheapest listing
+first, and only look further if it doesn't have enough. If that turns out not to
+combine into an actually-feasible purchase (rare -- can happen with awkward batch
+sizes), one fallback pass checks everything remaining before giving up.
+
+**Scope**: both the ranking/liquidity signal and the real order-book search are limited
+to the 5 regions that contain a major trade hub (not every highsec region) -- region-
+wide, so e.g. Perimeter's market still counts as part of Jita's region, just not
+somewhere with no trade hub at all. EVE's bulk-purchase liquidity is concentrated
+enough in these 5 that searching further afield added real latency (real per-item ESI
+calls, not a cheap batched one) for essentially no better prices in practice.
+
+**Latency**: real order-book data is fetched per (region, item) from ESI, which is
+slower than Fuzzwork's single batched-many-items-per-call aggregate endpoint, but the
+lazy/ranked fetching above means most calculations only ever check a handful of
+candidates. Missing/stale fetches that are needed run concurrently (a thread pool,
+since this is just waiting on network sockets -- see the "Not parallelized" note below
+for why that's a *different* kind of concurrency than the one that isn't safe here)
+with automatic retry/backoff for the occasional transient ESI hiccup. In practice the
+full "Compare buying locations" table (11 checks: every hub's region and station, plus
+the unrestricted scan across all 5 hub regions) now typically finishes in single-digit
+seconds to under a minute on a cold cache, depending on how many candidates need a
+fresh check. Results are cached for an hour on the ESI side and for the rest of the
+session on the app side, so recalculating with the same blueprint/ME/runs shortly after
+(or just changing which location you buy from) is fast.
 
 ## Building your own components/reactions
 
@@ -157,16 +208,29 @@ once you've confirmed it says "Yes" to actually price the plan that way.
 ## Buying from a combination of a few stations
 
 A middle ground between "one station" (most convenient, but sometimes pricier or
-infeasible) and "scattered across all of highsec" (cheapest, but could mean many
-stops: toggle "Limit to at most N stations" and pick N. Clicking "Find best combo"
-brute-forces every combination of up to N of the 5 hub stations (at most
-C(5,1)+...+C(5,5) = 31 combos, a few seconds), and uses whichever combination is
-cheapest while covering every required item -- showing a ranked table of the combos
-tried, and the winning purchase plan tagged with exactly which station to buy each
-item at. Only the 5 major hub stations are candidates; this tool doesn't have
-station-level price data anywhere else, and realistically those are the only stations
-liquid enough for bulk purchases anyway. The search only runs when you click the
-button (not on every page interaction), since it's slower than the other modes.
+infeasible) and "scattered across the hub regions" (cheapest, but doesn't say where to
+actually go shopping). Toggle "Limit to at most N stations" and pick N to use this as
+the actual purchase plan; it's also **shown automatically** (without changing the main
+plan) whenever "Buy from" is set to "Cheapest overall," since that mode alone doesn't
+tell you where to shop. Either way it brute-forces every combination of up to N
+candidate stations and uses whichever combination is cheapest while covering every
+required item -- a ranked table of the combos tried, and the winning plan tagged with
+exactly which station to buy each item at.
+
+By default the only candidates are the 5 major hub stations (at most
+C(5,1)+...+C(5,5) = 31 combos). Two checkboxes expand that:
+
+- **"Expand search to include systems near trade hubs"**: also considers highsec
+  (>50% security) systems within 5 jumps of a hub. A station there only actually gets
+  added as a candidate if real sell-order data shows it offers more than 10% of some
+  required mineral's total ISK value at a price better than the 5-hub baseline --
+  capped to the best 5 such stations found, so the combo search itself can't explode.
+  Runs automatically alongside the rest of the page (it's fast enough now that it
+  doesn't need its own button).
+- **"Expand search to include all highsec systems"**: the same real-data check, but
+  across every highsec system in the game instead of just those near a hub -- far more
+  regions need a real order-book check, so this is explicitly gated behind its own
+  button and can take a long time (potentially hours on a cold cache).
 
 ## Job installation cost, BPC copying, and build time
 
@@ -224,28 +288,42 @@ every widget change) would make the app feel sluggish. Two things keep that in c
   comparison-table row) since its result doesn't depend on which location you're
   pricing from -- see "Building your own components/reactions" above.
 
-**Not parallelized, deliberately.** An earlier version ran the comparison table's
-independent solves concurrently across threads for a real wall-clock speedup, but
-scipy's HiGHS MILP solver has documented segfaults/assertion failures tied to its own
-internal threading (upstream scipy issues #17220, #17250, #22188) -- calling it from
-several Python threads at once risked crashing the whole process with no Python
-traceback, which is exactly what happened during testing. It's sequential now; caching
-and the Recalculate gate are what actually keep it fast, not concurrency.
+**The MILP solves themselves are not parallelized, deliberately.** An earlier version
+ran the comparison table's independent solves concurrently across threads for a real
+wall-clock speedup, but scipy's HiGHS MILP solver has documented segfaults/assertion
+failures tied to its own internal threading (upstream scipy issues #17220, #17250,
+#22188) -- calling it from several Python threads at once risked crashing the whole
+process with no Python traceback, which is exactly what happened during testing. It's
+sequential now; caching and the Recalculate gate are what actually keep it fast, not
+concurrency.
+
+**The real order-book fetches (`order_book.py`) *are* parallelized**, and this is safe
+-- unlike the MILP case above, a thread pool here is only ever waiting on HTTP sockets
+(`requests.get`), never calling into HiGHS's native solver code, so there's no shared
+native state for threads to corrupt. This is what keeps depth-aware pricing (see above)
+from taking several minutes on a cold cache.
 
 ## Data sources and refresh cadence
 
 - **Static data** (blueprints, ore reprocessing yields, regions, systems, job times):
   from Fuzzwork's SDE CSV dumps. Barely changes; only refresh via `install.pyw` or
   `python -m indycalc.sde_loader` after a game update.
-- **Market prices**: from Fuzzwork's market aggregates API, one batched call per highsec
-  region *and* per hub station (never per item), and only when you click "Refresh
-  Prices" -- never automatically, to avoid hammering their servers.
+- **Market aggregate ranking signal**: from Fuzzwork's market aggregates API, one
+  batched call per trade hub region *and* per hub station (never per item), and only
+  when you click "Refresh Prices" -- never automatically, to avoid hammering their
+  servers. No longer the source of actual purchase prices -- see "Depth-aware pricing"
+  above.
+- **Real order-book prices** (`order_book.py`): from ESI directly, per (region, item),
+  fetched lazily for whatever candidates the ranking above says are worth checking.
+  Cached for an hour, then automatically refetched next time it's needed -- no manual
+  refresh button, since this can't be meaningfully batched the way the aggregate can.
 - **Industry data** (adjusted prices, system cost indices, for job cost estimates):
   from ESI directly, two global calls (not per-region/per-item), only when you click
   "Refresh Industry Data."
-- Regions covered are the ~19 that are (almost) entirely highsec. The five major trade
-  hubs (Jita, Amarr, Dodixie, Rens, Hek) map to both their dominant region and their
-  actual trade station (IDs looked up from the SDE, not guessed).
+- Regions covered are the 5 that contain a major trade hub (Jita, Amarr, Dodixie, Rens,
+  Hek), each mapped to both its dominant region and its actual trade station (IDs
+  looked up from the SDE, not guessed) -- see "Depth-aware pricing" above for why the
+  scope isn't every highsec region.
 
 ## Known simplifications
 
@@ -262,6 +340,17 @@ and the Recalculate gate are what actually keep it fast, not concurrency.
   batch-optimized MILP across the whole tree, ship + built components together.
 - Waste (leftover minerals above what's required) is valued at the current cheapest
   market sell price, not what you'd actually realize reprocessing/selling it.
+- The candidate ranking (see "Depth-aware pricing" above) relies on the Fuzzwork
+  aggregate cache, which is only as fresh as the last "Refresh Prices" click -- an ore
+  that recently became liquid but hasn't been refreshed there yet could rank low enough
+  to never get a real order-book check. Click "Refresh Prices" if a purchase plan looks
+  like it's missing an option you know exists in-game.
+- The lazy real-order-book fetch stops once every mineral has confirmed depth past a
+  safety margin, not once *every* candidate has been checked -- in rare cases a
+  candidate ranked further down (by the cheap aggregate signal) could theoretically
+  combine better than what got found, though the fallback pass (fetch everything
+  remaining if the greedy result doesn't actually work) catches the case where this
+  matters most: a plan that looks feasible on paper but isn't.
 - BPC copying cost formula is lower-confidence than the other cost math -- see above.
 - Build time assumes reactions fully complete before manufacturing starts (safe
   overestimate, not dependency-aware) and doesn't model character skill bonuses to
