@@ -9,9 +9,103 @@ import time
 import pandas as pd
 import streamlit as st
 
-from indycalc import blueprint_calc, optimizer, price_cache
+from indycalc import blueprint_calc, job_cost, optimizer, price_cache, production_chain
 from indycalc.ore_tiers import DEFAULT_REFINE_PCT, TIERS
 from indycalc.sde_loader import DB_PATH
+
+# Streamlit reruns this whole script on every widget interaction. Without
+# caching, every rerun redoes the full MILP-based optimize() call for every
+# entry in the buying-location comparison table (region + station for each
+# of 5 hubs = 11 calls), even when the change that triggered the rerun was
+# something unrelated (e.g. a job-cost slider that doesn't feed into buying
+# at all). st.cache_data memoizes by argument hash across reruns; cleared
+# explicitly whenever cached market/industry data is refreshed so results
+# can't go stale silently.
+cached_expand = st.cache_data(show_spinner=False)(production_chain.expand_requirements)
+cached_optimize = st.cache_data(show_spinner=False)(optimizer.optimize)
+cached_best_station_combo = st.cache_data(show_spinner=False)(optimizer.best_station_combo)
+
+
+@st.cache_data(show_spinner=False)
+def cached_comparison_table(
+    required, refine_pct, ore_mode, allow_direct_minerals,
+    allow_build_components, allow_build_reactions,
+    component_me_percent, reaction_reduction_percent, pre_expanded,
+) -> pd.DataFrame:
+    """The "compare buying locations" table: region-wide + single-station
+    cost for every hub, plus the unrestricted "cheapest overall" row -- 11
+    independent optimize() calls (sequential -- see optimize_many()'s
+    docstring for why not threaded). Cached as a whole so this only actually
+    runs once per distinct set of inputs, not on every rerun."""
+    common = dict(
+        required=required,
+        refine_pct=refine_pct,
+        ore_mode=ore_mode,
+        allow_direct_minerals=allow_direct_minerals,
+        allow_build_components=allow_build_components,
+        allow_build_reactions=allow_build_reactions,
+        component_me_percent=component_me_percent,
+        reaction_reduction_percent=reaction_reduction_percent,
+        pre_expanded=pre_expanded,
+    )
+
+    jobs = [{"region_names": None, **common}]
+    job_meta: list[tuple[str, str | None]] = [("Cheapest overall (scattered)", None)]
+    for hub, region in price_cache.TRADE_HUBS.items():
+        jobs.append({"region_names": [region], **common})
+        job_meta.append((hub, "region"))
+        jobs.append({"station_id": price_cache.HUB_STATION_IDS[hub], "station_label": hub, **common})
+        job_meta.append((hub, "station"))
+
+    results = optimizer.optimize_many(jobs)
+
+    by_hub: dict[str, dict] = {}
+    rows = []
+    for (label, kind), r in zip(job_meta, results):
+        if kind is None:
+            rows.append(
+                {
+                    "Buy from": label,
+                    "Total Cost (ISK)": round(r.total_cost, 2) if not r.infeasible_reason else None,
+                    "Total Volume (m3)": round(r.total_volume_m3, 2) if not r.infeasible_reason else None,
+                    "Status": "OK" if not r.infeasible_reason else r.infeasible_reason,
+                    "Single Station?": "",
+                    "Single Station Cost (ISK)": None,
+                }
+            )
+        elif kind == "region":
+            by_hub[label] = {
+                "Buy from": label,
+                "Total Cost (ISK)": round(r.total_cost, 2) if not r.infeasible_reason else None,
+                "Total Volume (m3)": round(r.total_volume_m3, 2) if not r.infeasible_reason else None,
+                "Status": "OK" if not r.infeasible_reason else r.infeasible_reason,
+            }
+        else:  # station
+            by_hub[label]["Single Station?"] = "Yes" if not r.infeasible_reason else "No"
+            by_hub[label]["Single Station Cost (ISK)"] = (
+                round(r.total_cost, 2) if not r.infeasible_reason else None
+            )
+
+    rows.extend(by_hub.values())
+    return pd.DataFrame(rows).sort_values("Total Cost (ISK)", na_position="last")
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds <= 0:
+        return "0s"
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes and not days:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
 
 st.set_page_config(page_title="EVE Industry Calculator", layout="wide")
 
@@ -64,12 +158,49 @@ with st.sidebar:
             "cached highsec regions -- the absolute ISK minimum, but you may need to "
             "collect ore from several different regions. Picking a single trade hub "
             "buys everything from that one hub's region instead, trading some ISK "
-            "for the convenience of one shopping trip."
+            "for the convenience of one shopping trip -- still possibly several "
+            "systems within that region, though. Check \"single station\" below for "
+            "genuinely one stop."
         ),
     )
     selected_region_names = (
         None if buy_mode == buy_mode_options[0] else [price_cache.TRADE_HUBS[buy_mode]]
     )
+    selected_station_id = None
+    selected_station_label = None
+    if buy_mode != buy_mode_options[0]:
+        prefer_single_station = st.toggle(
+            f"Buy everything from {buy_mode}'s station",
+            value=False,
+            help=(
+                "Prices everything from that hub's single busiest trade station "
+                "instead of the whole region -- genuinely one stop, but will fail "
+                "if something needed isn't liquid at that specific station (check "
+                "the comparison table below first)."
+            ),
+        )
+        if prefer_single_station:
+            selected_station_id = price_cache.HUB_STATION_IDS[buy_mode]
+            selected_station_label = buy_mode
+            selected_region_names = None
+
+    use_station_combo = st.toggle(
+        "Limit to at most N stations",
+        value=False,
+        help=(
+            "Searches every combination of up to N of the 5 hub stations and uses "
+            "whichever combination is cheapest while covering everything -- a "
+            "middle ground between one station (most convenient) and scattering "
+            "across all of highsec (cheapest). Shown in its own section below "
+            "since the search takes a few seconds."
+        ),
+    )
+    max_stations_combo = 2
+    if use_station_combo:
+        max_stations_combo = st.number_input("N", min_value=1, max_value=5, value=2, step=1)
+        selected_region_names = None
+        selected_station_id = None
+        selected_station_label = None
 
     st.header("Ore sourcing")
     ore_mode_labels = {
@@ -102,6 +233,114 @@ with st.sidebar:
     )
     allow_direct_minerals = not no_direct
 
+    st.header("Production")
+    allow_build_components = st.toggle(
+        "Craft components myself",
+        value=False,
+        help=(
+            "Components (Tech II items, etc.) have their own Manufacturing blueprint. "
+            "When on, each component is priced both ways -- buy it outright, or build "
+            "it from its own materials -- and whichever is cheaper is used."
+        ),
+    )
+    component_me_percent = 0.0
+    if allow_build_components:
+        component_me_percent = st.number_input(
+            "Component ME %",
+            min_value=0.0,
+            max_value=10.0,
+            value=0.0,
+            step=1.0,
+            help="Material Efficiency level of the component blueprints you'd use. Invented T2 BPCs are usually 0-4%.",
+        )
+
+    allow_build_reactions = st.toggle(
+        "Craft reaction materials myself",
+        value=False,
+        help=(
+            "Reaction materials (e.g. Fernite Carbide) have their own Reaction formula. "
+            "When on, any reaction material pulled in while building a component is "
+            "priced both ways too. Only matters if \"Craft components myself\" finds "
+            "something worth building."
+        ),
+    )
+    reaction_reduction_percent = 0.0
+    if allow_build_reactions:
+        reaction_reduction_percent = st.number_input(
+            "Reaction material reduction %",
+            min_value=0.0,
+            max_value=50.0,
+            value=0.0,
+            step=1.0,
+            help=(
+                "Reaction formulas have no ME research -- this represents your "
+                "refinery's Reaction rig bonus instead, if any."
+            ),
+        )
+
+    st.header("Build location & job cost")
+    include_job_cost = st.toggle(
+        "Include job installation cost",
+        value=False,
+        help=(
+            "Off by default since it needs inputs you may not know offhand: which "
+            "system you'll run the job in, and that station's facility tax rate. "
+            "This is a separate location from \"Where to buy\" above -- you can buy "
+            "materials in one place and build somewhere else entirely."
+        ),
+    )
+    build_system_id = None
+    build_system_name = None
+    facility_tax_pct = 0.0
+    manufacturing_slots = 1
+    reaction_slots = 1
+    time_efficiency_pct = 0.0
+    include_copy_cost = False
+    if include_job_cost:
+        build_system_query = st.text_input("Build system search", value="Jita")
+        system_matches = job_cost.search_systems(build_system_query) if build_system_query else []
+        if system_matches:
+            system_labels = [name for _sid, name in system_matches]
+            build_system_selected = st.selectbox("Build system", options=range(len(system_matches)), format_func=lambda i: system_labels[i])
+            build_system_id, build_system_name = system_matches[build_system_selected]
+        else:
+            st.warning("No highsec system matches that search.")
+
+        facility_tax_pct = st.number_input(
+            "Facility tax %", min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+            help="Set by whoever owns the station/structure you build in -- 0% for your own unrigged structure, more at NPC stations or other players' structures.",
+        )
+        col_a, col_b = st.columns(2)
+        manufacturing_slots = col_a.number_input("Manufacturing job slots", min_value=1, value=1, step=1)
+        reaction_slots = col_b.number_input("Reaction job slots", min_value=1, value=1, step=1)
+        time_efficiency_pct = st.number_input(
+            "Time Efficiency %", min_value=0.0, max_value=20.0, value=0.0, step=2.0,
+            help="TE research level of the blueprints you're building with (manufacturing only -- reactions have no TE research).",
+        )
+
+        include_copy_cost = st.toggle(
+            "I'll copy a BPC instead of using the BPO directly",
+            value=False,
+            help=(
+                "If you own a researched BPO but don't want to tie it up running the "
+                "job, adds the cost to make a disposable copy with just enough runs "
+                "instead. Applies to the top-level blueprint and every component "
+                "chosen to build (not reactions -- reaction formulas can't be copied)."
+            ),
+        )
+
+        last_industry_refresh = job_cost.last_refreshed()
+        if last_industry_refresh:
+            age_min = (time.time() - last_industry_refresh) / 60
+            st.caption(f"Industry data last refreshed {age_min:.0f} min ago")
+        else:
+            st.caption("Industry data never refreshed yet")
+        if st.button("Refresh Industry Data (adjusted prices + cost indices)"):
+            with st.spinner("Fetching adjusted prices and system cost indices from ESI..."):
+                n_prices, n_indices = job_cost.refresh_industry_data()
+            st.success(f"Refreshed {n_prices} adjusted prices, {n_indices} cost index rows.")
+            st.rerun()
+
     st.header("Market prices")
     last_refresh = price_cache.last_refreshed()
     if last_refresh:
@@ -112,6 +351,7 @@ with st.sidebar:
     if st.button("Refresh Prices (highsec regions)"):
         with st.spinner("Fetching prices from Fuzzworks across highsec regions..."):
             n = price_cache.refresh_prices()
+        st.cache_data.clear()  # prices changed -- don't serve stale cached optimize() results
         st.success(f"Refreshed {n} region/ore price rows.")
         st.rerun()
 
@@ -126,6 +366,66 @@ with st.sidebar:
                 step=0.1,
                 key=f"refine_{tier}",
             )
+
+# Everything below this point is the expensive part (the buy-side MILP,
+# potentially 11+ solves for the comparison table). Sidebar widgets above
+# still update instantly (conditional sections appearing/disappearing etc.)
+# on every interaction since that's just cheap rerendering, but the actual
+# recompute is gated behind this button so adjusting several sidebar options
+# in a row doesn't trigger a fresh solve after each individual change --
+# only once, when you're done and click it.
+live_settings = dict(
+    bp_type_id=bp_type_id,
+    bp_name=bp_name,
+    me_percent=me_percent,
+    runs=runs,
+    ore_mode=ore_mode,
+    allow_direct_minerals=allow_direct_minerals,
+    allow_build_components=allow_build_components,
+    allow_build_reactions=allow_build_reactions,
+    component_me_percent=component_me_percent,
+    reaction_reduction_percent=reaction_reduction_percent,
+    buy_mode=buy_mode,
+    selected_region_names=selected_region_names,
+    selected_station_id=selected_station_id,
+    selected_station_label=selected_station_label,
+    use_station_combo=use_station_combo,
+    max_stations_combo=max_stations_combo,
+    refine_pct=dict(refine_pct),
+)
+
+recalc_clicked = st.button("🔄 Recalculate", type="primary")
+if recalc_clicked or "committed_settings" not in st.session_state:
+    st.session_state["committed_settings"] = live_settings
+    st.session_state.pop("combo_search", None)  # tied to the old settings, no longer valid
+
+committed = st.session_state["committed_settings"]
+is_stale = committed != live_settings
+if is_stale:
+    st.info(
+        "Sidebar settings have changed since the last calculation -- showing results for the "
+        "previous settings. Click \"Recalculate\" above to update."
+    )
+
+# Everything from here on uses the *committed* settings, not whatever the
+# sidebar currently shows, so results stay stable until Recalculate is clicked.
+bp_type_id = committed["bp_type_id"]
+bp_name = committed["bp_name"]
+me_percent = committed["me_percent"]
+runs = committed["runs"]
+ore_mode = committed["ore_mode"]
+allow_direct_minerals = committed["allow_direct_minerals"]
+allow_build_components = committed["allow_build_components"]
+allow_build_reactions = committed["allow_build_reactions"]
+component_me_percent = committed["component_me_percent"]
+reaction_reduction_percent = committed["reaction_reduction_percent"]
+buy_mode = committed["buy_mode"]
+selected_region_names = committed["selected_region_names"]
+selected_station_id = committed["selected_station_id"]
+selected_station_label = committed["selected_station_label"]
+use_station_combo = committed["use_station_combo"]
+max_stations_combo = committed["max_stations_combo"]
+refine_pct = committed["refine_pct"]
 
 st.subheader(f"{bp_name} — ME {me_percent}% — {runs} run(s)")
 
@@ -147,42 +447,99 @@ req_df = pd.DataFrame(
 ).sort_values("Material")
 st.dataframe(req_df, hide_index=True, width='stretch')
 
+# The build-vs-buy decision is region-independent (see production_chain.py),
+# so it's computed once here and reused for every location comparison below
+# instead of every one of them redoing the same expansion + component price
+# lookups.
+expansion = None
+if allow_build_components or allow_build_reactions:
+    expansion = cached_expand(
+        required, allow_build_components, allow_build_reactions,
+        component_me_percent, reaction_reduction_percent,
+    )
+
 st.subheader("Compare buying locations")
-comparison_rows = []
-for label, region_names in [("Cheapest overall (scattered)", None)] + [
-    (hub, [region]) for hub, region in price_cache.TRADE_HUBS.items()
-]:
-    r = optimizer.optimize(
-        required,
-        refine_pct,
-        region_names=region_names,
-        ore_mode=ore_mode,
-        allow_direct_minerals=allow_direct_minerals,
-    )
-    comparison_rows.append(
-        {
-            "Buy from": label,
-            "Total Cost (ISK)": round(r.total_cost, 2) if not r.infeasible_reason else None,
-            "Total Volume (m3)": round(r.total_volume_m3, 2) if not r.infeasible_reason else None,
-            "Status": "OK" if not r.infeasible_reason else r.infeasible_reason,
-        }
-    )
-comparison_df = pd.DataFrame(comparison_rows).sort_values("Total Cost (ISK)", na_position="last")
+comparison_df = cached_comparison_table(
+    required, refine_pct, ore_mode, allow_direct_minerals,
+    allow_build_components, allow_build_reactions,
+    component_me_percent, reaction_reduction_percent, expansion,
+)
 st.dataframe(comparison_df, hide_index=True, width='stretch')
 
-result = optimizer.optimize(
-    required,
-    refine_pct,
-    region_names=selected_region_names,
-    ore_mode=ore_mode,
-    allow_direct_minerals=allow_direct_minerals,
-)
+combo_search = None
+if use_station_combo:
+    st.subheader(f"Best combo of up to {max_stations_combo} stations")
+    if st.button("Find best combo"):
+        with st.spinner(f"Searching combinations of up to {max_stations_combo} of the 5 hub stations..."):
+            best_combo, all_combo_results = cached_best_station_combo(
+                required,
+                refine_pct,
+                max_stations_combo,
+                ore_mode=ore_mode,
+                allow_direct_minerals=allow_direct_minerals,
+                allow_build_components=allow_build_components,
+                allow_build_reactions=allow_build_reactions,
+                component_me_percent=component_me_percent,
+                reaction_reduction_percent=reaction_reduction_percent,
+                pre_expanded=expansion,
+            )
+        st.session_state["combo_search"] = (best_combo, all_combo_results)
+    combo_search = st.session_state.get("combo_search")
+    if combo_search:
+        best_combo, all_combo_results = combo_search
+        if best_combo is None:
+            st.error(f"No combination of up to {max_stations_combo} stations covers every required item.")
+        else:
+            st.success(f"Best: {' + '.join(best_combo.station_names)} — {best_combo.result.total_cost:,.2f} ISK")
+            ranked = sorted(
+                all_combo_results,
+                key=lambda e: e.result.total_cost if not e.result.infeasible_reason else float("inf"),
+            )
+            combo_df = pd.DataFrame(
+                [
+                    {
+                        "Stations": " + ".join(e.station_names),
+                        "Total Cost (ISK)": round(e.result.total_cost, 2) if not e.result.infeasible_reason else None,
+                        "Status": "OK" if not e.result.infeasible_reason else "Missing coverage",
+                    }
+                    for e in ranked[:10]
+                ]
+            )
+            st.dataframe(combo_df, hide_index=True, width='stretch')
+    else:
+        st.info('Click "Find best combo" to search (takes a few seconds).')
+
+if use_station_combo:
+    if not combo_search or combo_search[0] is None:
+        st.stop()
+    result = combo_search[0].result
+    plan_location = f"Best {len(combo_search[0].station_names)}-station combo: {' + '.join(combo_search[0].station_names)}"
+else:
+    result = cached_optimize(
+        required,
+        refine_pct,
+        region_names=selected_region_names,
+        station_id=selected_station_id,
+        station_label=selected_station_label,
+        ore_mode=ore_mode,
+        allow_direct_minerals=allow_direct_minerals,
+        allow_build_components=allow_build_components,
+        allow_build_reactions=allow_build_reactions,
+        component_me_percent=component_me_percent,
+        reaction_reduction_percent=reaction_reduction_percent,
+        pre_expanded=expansion,
+    )
+    plan_location = f"{buy_mode} (single station)" if selected_station_id is not None else buy_mode
 
 if result.infeasible_reason:
     st.error(result.infeasible_reason)
     st.stop()
 
-st.subheader(f"Purchase plan — {buy_mode}")
+# Crafted components can pull in minerals not part of the top-level blueprint's
+# own requirements -- make sure their names are resolvable too.
+mat_names.update(blueprint_calc.material_names(list(result.required.keys())))
+
+st.subheader(f"Purchase plan — {plan_location}")
 
 if result.purchases:
     st.markdown("**Ore to buy and reprocess (or mineral to buy directly, when that's cheaper)**")
@@ -192,7 +549,7 @@ if result.purchases:
                 "Ore / Mineral": p.type_name,
                 "Tier": p.tier,
                 "Quantity": p.quantity,
-                "Cheapest Region": p.region_name,
+                "Cheapest Location": p.location_name,
                 "Unit Price (ISK)": round(p.unit_price, 2),
                 "Cost (ISK)": round(p.cost, 2),
                 "Volume (m3)": round(p.volume_m3, 2),
@@ -214,7 +571,7 @@ if result.component_purchases:
             {
                 "Component": p.type_name,
                 "Quantity": p.quantity,
-                "Cheapest Region": p.region_name,
+                "Cheapest Location": p.location_name,
                 "Unit Price (ISK)": round(p.unit_price, 2),
                 "Cost (ISK)": round(p.cost, 2),
                 "Volume (m3)": round(p.volume_m3, 2),
@@ -224,20 +581,111 @@ if result.component_purchases:
     )
     st.dataframe(component_df, hide_index=True, width='stretch')
 
-if result.unpriced_components:
-    unpriced_names = blueprint_calc.material_names(list(result.unpriced_components.keys()))
-    st.warning(
-        "No cached market price for: "
-        + ", ".join(
-            f"{unpriced_names.get(tid, tid)} (need {qty})"
-            for tid, qty in result.unpriced_components.items()
-        )
-        + ". Not included in total cost below."
+if result.build_decisions:
+    st.subheader("Build vs buy decisions")
+    decisions_df = pd.DataFrame(
+        [
+            {
+                "Item": d.name,
+                "Decision": d.decision,
+                "Needed": d.needed_qty,
+                "Runs": d.runs or None,
+                "Produced": d.produced_qty or None,
+                "Build Cost (ISK)": round(d.build_cost, 2) if d.build_cost is not None else None,
+                "Buy Cost (ISK)": round(d.buy_cost, 2) if d.buy_cost is not None else None,
+            }
+            for d in result.build_decisions
+        ]
     )
+    st.dataframe(decisions_df, hide_index=True, width='stretch')
 
 col1, col2 = st.columns(2)
-col1.metric("Total cost", f"{result.total_cost:,.2f} ISK")
+col1.metric("Total material cost", f"{result.total_cost:,.2f} ISK")
 col2.metric("Total volume", f"{result.total_volume_m3:,.2f} m3")
+
+if include_job_cost and build_system_id is not None:
+    st.subheader(f"Job installation cost — {build_system_name}")
+    job_rows = []
+    missing_job_data = []
+
+    top_cost = job_cost.manufacturing_job_cost(bp_type_id, runs, build_system_id, facility_tax_pct)
+    if top_cost is None:
+        missing_job_data.append(bp_name)
+    else:
+        job_rows.append({"Item": bp_name, "Activity": "manufacturing", "Runs": runs, "Job Cost (ISK)": round(top_cost, 2)})
+
+    for d in result.build_decisions:
+        if d.decision != "build":
+            continue
+        producer = production_chain.get_producer(d.type_id)
+        if producer is None:
+            missing_job_data.append(d.name)
+            continue
+        if producer["activity_id"] == 1:
+            cost = job_cost.manufacturing_job_cost(producer["blueprint_type_id"], d.runs, build_system_id, facility_tax_pct)
+            activity = "manufacturing"
+        else:
+            cost = job_cost.reaction_job_cost(producer["blueprint_type_id"], d.runs, build_system_id, facility_tax_pct)
+            activity = "reaction"
+        if cost is None:
+            missing_job_data.append(d.name)
+            continue
+        job_rows.append({"Item": d.name, "Activity": activity, "Runs": d.runs, "Job Cost (ISK)": round(cost, 2)})
+
+    if job_rows:
+        job_df = pd.DataFrame(job_rows)
+        st.dataframe(job_df, hide_index=True, width='stretch')
+        total_job_cost = sum(r["Job Cost (ISK)"] for r in job_rows)
+        st.metric("Total job installation cost", f"{total_job_cost:,.2f} ISK")
+    if missing_job_data:
+        st.warning(
+            "No adjusted-price/cost-index data for: " + ", ".join(missing_job_data)
+            + " -- click \"Refresh Industry Data\" if you haven't yet."
+        )
+
+    if include_copy_cost:
+        st.subheader("BPC copying cost")
+        st.caption(
+            "Lower confidence than the job cost above -- the documented formula for "
+            "copying is less well established. Treat as directional."
+        )
+        copy_rows = []
+        top_copy = job_cost.copy_job_cost(bp_type_id, runs, build_system_id, facility_tax_pct)
+        if top_copy is not None:
+            copy_rows.append({"Item": bp_name, "Runs": runs, "Copy Cost (ISK)": round(top_copy, 2)})
+        for d in result.build_decisions:
+            if d.decision != "build":
+                continue
+            producer = production_chain.get_producer(d.type_id)
+            if producer is None or producer["activity_id"] != 1:
+                continue  # reactions can't be copied
+            c = job_cost.copy_job_cost(producer["blueprint_type_id"], d.runs, build_system_id, facility_tax_pct)
+            if c is not None:
+                copy_rows.append({"Item": d.name, "Runs": d.runs, "Copy Cost (ISK)": round(c, 2)})
+        if copy_rows:
+            copy_df = pd.DataFrame(copy_rows)
+            st.dataframe(copy_df, hide_index=True, width='stretch')
+            st.metric("Total BPC copying cost", f"{sum(r['Copy Cost (ISK)'] for r in copy_rows):,.2f} ISK")
+
+    st.subheader("Estimated build time")
+    time_estimate = job_cost.estimate_build_time(
+        bp_type_id, runs, result.build_decisions, manufacturing_slots, reaction_slots, time_efficiency_pct
+    )
+    tcol1, tcol2, tcol3 = st.columns(3)
+    tcol1.metric("Reaction phase", _format_duration(time_estimate.reaction_phase_seconds))
+    tcol2.metric("Manufacturing phase", _format_duration(time_estimate.manufacturing_phase_seconds))
+    tcol3.metric("Total (sequential phases)", _format_duration(time_estimate.total_seconds))
+    if time_estimate.jobs:
+        with st.expander("Per-job breakdown"):
+            jobs_df = pd.DataFrame(
+                [
+                    {"Item": j.label, "Activity": j.activity, "Duration": _format_duration(j.seconds)}
+                    for j in time_estimate.jobs
+                ]
+            )
+            st.dataframe(jobs_df, hide_index=True, width='stretch')
+    if time_estimate.missing_time_data:
+        st.warning("No job time data for: " + ", ".join(time_estimate.missing_time_data))
 
 if result.waste_qty:
     st.subheader("Waste (leftover minerals above requirement)")
@@ -246,7 +694,7 @@ if result.waste_qty:
             {
                 "Mineral": mat_names.get(mid, str(mid)),
                 "Produced": round(result.produced.get(mid, 0), 1),
-                "Required": required[mid],
+                "Required": result.required.get(mid, 0),
                 "Leftover": round(result.waste_qty.get(mid, 0), 1),
                 "Leftover Value (ISK)": round(result.waste_isk.get(mid, 0), 2),
             }

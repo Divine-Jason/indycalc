@@ -2,9 +2,15 @@
 
 Starts the Streamlit server in the background (if not already running),
 opens it in your default browser, and shows a small always-on-top-free
-control window in the taskbar so you have a normal way to stop the server
-(button, or just close the window) instead of having to hunt it down in
-Task Manager or run stop_indycalc.pyw.
+control window (taskbar on Windows, Dock on macOS) so you have a normal way
+to stop the server (button, or just close the window) instead of having to
+hunt it down in Task Manager/Activity Monitor.
+
+On Windows this is double-clicked directly (the .pyw extension is
+associated with pythonw.exe, so it runs with no console window). On macOS,
+launch_indycalc.command double-clicks instead and runs `python3
+launch_indycalc.pyw` -- the interpreter doesn't care about the .pyw
+extension, that's purely a Windows file-association convention.
 """
 import subprocess
 import sys
@@ -22,7 +28,8 @@ SERVER_LOG_PATH = ROOT / "streamlit_server.log"
 PID_PATH = ROOT / "indycalc.pid"
 PORT = 8501
 
-CREATE_NO_WINDOW = 0x08000000
+IS_WINDOWS = sys.platform == "win32"
+CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
 
 def log(message: str) -> None:
@@ -40,6 +47,14 @@ def is_running() -> bool:
 
 def start_server() -> None:
     log_file = open(SERVER_LOG_PATH, "a", encoding="utf-8")
+    spawn_kwargs = {}
+    if IS_WINDOWS:
+        spawn_kwargs["creationflags"] = CREATE_NO_WINDOW
+    else:
+        # POSIX: put the server in its own new session/process group, so it
+        # (a) survives the launching shell/Terminal window closing, and
+        # (b) can be killed as a whole tree later via os.killpg().
+        spawn_kwargs["start_new_session"] = True
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "streamlit", "run", str(APP),
@@ -48,8 +63,8 @@ def start_server() -> None:
         ],
         stdout=log_file,
         stderr=log_file,
-        creationflags=CREATE_NO_WINDOW,
         cwd=str(ROOT),
+        **spawn_kwargs,
     )
     PID_PATH.write_text(str(proc.pid))
     log(f"Started Streamlit server, pid={proc.pid}")
@@ -65,11 +80,23 @@ def stop_server() -> None:
     if not PID_PATH.exists():
         return
     pid = PID_PATH.read_text().strip()
-    subprocess.run(
-        ["taskkill", "/PID", pid, "/F", "/T"],
-        capture_output=True,
-        creationflags=CREATE_NO_WINDOW,
-    )
+    if IS_WINDOWS:
+        subprocess.run(
+            ["taskkill", "/PID", pid, "/F", "/T"],
+            capture_output=True,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    else:
+        import os
+        import signal
+
+        try:
+            # pid is the session/process-group leader (see start_new_session
+            # above), so killing that group takes the whole tree with it,
+            # matching what taskkill's /T does on Windows.
+            os.killpg(int(pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # already gone
     PID_PATH.unlink(missing_ok=True)
     log(f"Stopped server, pid={pid}")
 

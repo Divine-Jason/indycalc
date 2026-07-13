@@ -1,9 +1,10 @@
 """One-time setup for the EVE Industry Calculator -- no command prompt needed.
 
-Double-click this after installing Python. It installs the required Python
-packages, then builds the local EVE data cache and does an initial market
-price refresh, showing progress in a small window the whole time. Once it
-says "Setup complete," use launch_indycalc.pyw to run the app.
+Double-click this after installing Python (install.command on macOS,
+install.pyw directly on Windows). It installs the required Python packages,
+then builds the local EVE data cache and does an initial market price
+refresh, showing progress in a small window the whole time. Once it says
+"Setup complete," use launch_indycalc.pyw/.command to run the app.
 
 Safe to re-run any time -- reinstalling packages and rebuilding the data
 cache are both idempotent.
@@ -19,7 +20,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 LOG_PATH = ROOT / "install.log"
-CREATE_NO_WINDOW = 0x08000000
+IS_WINDOWS = sys.platform == "win32"
+CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
 STEPS = [
     ("Installing Python packages (streamlit, scipy, pandas, requests)...",
@@ -46,7 +48,7 @@ def run_steps(status_queue: "queue.Queue[tuple[str, str]]") -> None:
                 cwd=str(ROOT),
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                creationflags=CREATE_NO_WINDOW,
+                **({"creationflags": CREATE_NO_WINDOW} if IS_WINDOWS else {}),
             )
         if result.returncode != 0:
             log(f"FAILED (exit {result.returncode}): {' '.join(cmd)}")

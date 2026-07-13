@@ -20,6 +20,8 @@ SDE_CSV_BASE = "https://www.fuzzwork.co.uk/dump/latest/csv"
 DB_PATH = Path(__file__).parent / "data" / "sde.db"
 
 MANUFACTURING_ACTIVITY_ID = 1
+COPYING_ACTIVITY_ID = 5
+REACTION_ACTIVITY_ID = 11
 ASTEROID_CATEGORY_ID = 25  # invCategories: ore (incl. compressed variants) lives here
 
 
@@ -49,17 +51,47 @@ def load_sde(db_path: Path = DB_PATH) -> None:
         reprocess.columns = ["ore_type_id", "material_type_id", "quantity"]
         reprocess.to_sql("reprocess_materials", conn, if_exists="replace", index=False)
 
-        print("Fetching industryActivityMaterials.csv (blueprint requirements) ...")
-        bp_mats = _fetch_csv("industryActivityMaterials")
-        bp_mats = bp_mats[bp_mats["activityID"] == MANUFACTURING_ACTIVITY_ID]
+        print("Fetching industryActivityMaterials.csv (blueprint + reaction requirements) ...")
+        activity_mats = _fetch_csv("industryActivityMaterials")
+
+        bp_mats = activity_mats[activity_mats["activityID"] == MANUFACTURING_ACTIVITY_ID]
         bp_mats = bp_mats[["typeID", "materialTypeID", "quantity"]]
         bp_mats.columns = ["blueprint_type_id", "material_type_id", "quantity"]
         bp_mats.to_sql("blueprint_materials", conn, if_exists="replace", index=False)
+
+        reaction_mats = activity_mats[activity_mats["activityID"] == REACTION_ACTIVITY_ID]
+        reaction_mats = reaction_mats[["typeID", "materialTypeID", "quantity"]]
+        reaction_mats.columns = ["formula_type_id", "material_type_id", "quantity"]
+        reaction_mats.to_sql("reaction_materials", conn, if_exists="replace", index=False)
+
+        print("Fetching industryActivityProducts.csv (blueprint/reaction outputs) ...")
+        activity_products = _fetch_csv("industryActivityProducts")
+        producers = activity_products[
+            activity_products["activityID"].isin([MANUFACTURING_ACTIVITY_ID, REACTION_ACTIVITY_ID])
+        ][["productTypeID", "typeID", "activityID", "quantity"]]
+        producers.columns = ["product_type_id", "blueprint_type_id", "activity_id", "quantity"]
+        producers.to_sql("producers", conn, if_exists="replace", index=False)
+
+        print("Fetching industryActivity.csv (job times) ...")
+        activity_times = _fetch_csv("industryActivity")
+        activity_times = activity_times[
+            activity_times["activityID"].isin([MANUFACTURING_ACTIVITY_ID, COPYING_ACTIVITY_ID, REACTION_ACTIVITY_ID])
+        ][["typeID", "activityID", "time"]]
+        activity_times.columns = ["type_id", "activity_id", "time_seconds"]
+        activity_times.to_sql("activity_times", conn, if_exists="replace", index=False)
 
         print("Fetching mapRegions.csv ...")
         regions = _fetch_csv("mapRegions")[["regionID", "regionName"]]
         regions.columns = ["region_id", "region_name"]
         regions.to_sql("regions", conn, if_exists="replace", index=False)
+
+        print("Fetching mapSolarSystems.csv (highsec systems, for job-cost system picker) ...")
+        systems = _fetch_csv("mapSolarSystems")
+        systems = systems[systems["security"] >= 0.5][
+            ["solarSystemID", "solarSystemName", "regionID", "security"]
+        ]
+        systems.columns = ["system_id", "system_name", "region_id", "security"]
+        systems.to_sql("solar_systems", conn, if_exists="replace", index=False)
 
         print("Deriving ore tier table from ore_tiers.py ...")
         asteroid_group_ids = set(inv_groups[inv_groups["categoryID"] == ASTEROID_CATEGORY_ID]["groupID"])
@@ -89,6 +121,18 @@ def load_sde(db_path: Path = DB_PATH) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_bp_mats_bp ON blueprint_materials(blueprint_type_id)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reaction_mats_formula ON reaction_materials(formula_type_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_producers_product ON producers(product_type_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_solar_systems_name ON solar_systems(system_name)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_activity_times_type ON activity_times(type_id, activity_id)"
+        )
         conn.commit()
 
         for table in [
@@ -96,7 +140,11 @@ def load_sde(db_path: Path = DB_PATH) -> None:
             "inv_groups",
             "reprocess_materials",
             "blueprint_materials",
+            "reaction_materials",
+            "producers",
+            "activity_times",
             "regions",
+            "solar_systems",
             "ore_tiers",
         ]:
             count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]

@@ -58,16 +58,30 @@ MINERAL_TYPE_IDS = {
     11399: "Morphite",
 }
 
-# The five major player trade hubs, mapped to their dominant region. Region-level
-# aggregation can't isolate a single station, but each of these hubs dominates
-# its region's trade volume enough that "cheapest in the region" is a good proxy
-# for "cheapest at the hub station" without needing station-level ESI order data.
+# The five major player trade hubs, mapped to their dominant region for the
+# "scattered across the region" comparison, and to their actual trade station
+# for the "everything from one station" comparison (Fuzzwork's aggregates
+# endpoint takes a `station=` param, confirmed to return genuinely different,
+# station-specific numbers from the region-wide `region=` aggregate). Station
+# IDs looked up from the SDE's staStations table, not guessed:
+#   Jita 4 - Moon 4 - Caldari Navy Assembly Plant, Amarr VIII (Oris) - Emperor
+#   Family Academy, Dodixie 9 - Moon 20 - Federation Navy Assembly Plant,
+#   Rens 6 - Moon 8 - Brutor Tribe Treasury, Hek 8 - Moon 12 - Boundless
+#   Creation Factory.
 TRADE_HUBS: dict[str, str] = {
     "Jita": "The Forge",
     "Amarr": "Domain",
     "Dodixie": "Sinq Laison",
     "Rens": "Heimatar",
     "Hek": "Metropolis",
+}
+
+HUB_STATION_IDS: dict[str, int] = {
+    "Jita": 60003760,
+    "Amarr": 60008494,
+    "Dodixie": 60011866,
+    "Rens": 60004588,
+    "Hek": 60005686,
 }
 
 _CHUNK_SIZE = 200  # generous headroom well under any practical URL length limit
@@ -122,6 +136,26 @@ def _chunked(items: list[int], size: int) -> list[list[int]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+def _parse_aggregates_rows(location_id: int, type_ids: list[int], data: dict, fetched_at: float) -> list[tuple]:
+    rows = []
+    for type_id_str, entry in data.items():
+        sell = entry.get("sell", {})
+        buy = entry.get("buy", {})
+        rows.append(
+            (
+                location_id,
+                int(type_id_str),
+                float(sell["min"]) if sell.get("min") else None,
+                float(sell["percentile"]) if sell.get("percentile") else None,
+                float(sell["volume"]) if sell.get("volume") else None,
+                int(float(sell["orderCount"])) if sell.get("orderCount") else None,
+                float(buy["max"]) if buy.get("max") else None,
+                fetched_at,
+            )
+        )
+    return rows
+
+
 def _fetch_and_store(
     conn: sqlite3.Connection, type_ids: list[int], region_ids: dict[int, str]
 ) -> int:
@@ -137,23 +171,7 @@ def _fetch_and_store(
                 timeout=30,
             )
             resp.raise_for_status()
-            data = resp.json()
-            rows = []
-            for type_id_str, entry in data.items():
-                sell = entry.get("sell", {})
-                buy = entry.get("buy", {})
-                rows.append(
-                    (
-                        region_id,
-                        int(type_id_str),
-                        float(sell["min"]) if sell.get("min") else None,
-                        float(sell["percentile"]) if sell.get("percentile") else None,
-                        float(sell["volume"]) if sell.get("volume") else None,
-                        int(float(sell["orderCount"])) if sell.get("orderCount") else None,
-                        float(buy["max"]) if buy.get("max") else None,
-                        fetched_at,
-                    )
-                )
+            rows = _parse_aggregates_rows(region_id, chunk, resp.json(), fetched_at)
             conn.executemany(
                 """
                 INSERT INTO market_prices
@@ -178,6 +196,197 @@ def _fetch_and_store(
             # (e.g. another Streamlit session rerun).
             conn.commit()
     return written
+
+
+def _ensure_station_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS station_prices (
+            station_id INTEGER NOT NULL,
+            type_id INTEGER NOT NULL,
+            sell_min REAL,
+            sell_percentile REAL,
+            sell_volume REAL,
+            sell_order_count INTEGER,
+            buy_max REAL,
+            fetched_at REAL NOT NULL,
+            PRIMARY KEY (station_id, type_id)
+        )
+        """
+    )
+    conn.commit()
+
+
+def refresh_station_prices(db_path: Path = DB_PATH) -> int:
+    """Refresh cached sell prices for all ore + mineral types at each of the
+    5 major hub stations. Returns the number of (station, type) rows written.
+    """
+    conn = db.connect(db_path)
+    try:
+        _ensure_table(conn)
+        _ensure_station_table(conn)
+        type_ids = _all_ore_type_ids(conn) + list(MINERAL_TYPE_IDS)
+        fetched_at = time.time()
+        written = 0
+        for station_id in HUB_STATION_IDS.values():
+            for chunk in _chunked(type_ids, _CHUNK_SIZE):
+                resp = requests.get(
+                    AGGREGATES_URL,
+                    params={"station": station_id, "types": ",".join(map(str, chunk))},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                rows = _parse_aggregates_rows(station_id, chunk, resp.json(), fetched_at)
+                conn.executemany(
+                    """
+                    INSERT INTO station_prices
+                        (station_id, type_id, sell_min, sell_percentile, sell_volume,
+                         sell_order_count, buy_max, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(station_id, type_id) DO UPDATE SET
+                        sell_min=excluded.sell_min,
+                        sell_percentile=excluded.sell_percentile,
+                        sell_volume=excluded.sell_volume,
+                        sell_order_count=excluded.sell_order_count,
+                        buy_max=excluded.buy_max,
+                        fetched_at=excluded.fetched_at
+                    """,
+                    rows,
+                )
+                written += len(rows)
+                conn.commit()
+        return written
+    finally:
+        conn.close()
+
+
+def best_station_prices(type_ids: list[int], station_id: int, db_path: Path = DB_PATH) -> dict[int, dict]:
+    """Cheapest cached sell price for each type_id at a single station:
+    {type_id: {"price": float}}. Same liquidity filter as best_prices()."""
+    if not type_ids:
+        return {}
+    conn = db.connect(db_path)
+    try:
+        _ensure_station_table(conn)
+        placeholders = ",".join("?" for _ in type_ids)
+        rows = conn.execute(
+            f"""
+            SELECT type_id, sell_min, sell_percentile
+            FROM station_prices
+            WHERE station_id = ? AND type_id IN ({placeholders})
+              AND sell_volume >= {MIN_LIQUIDITY_VOLUME}
+              AND sell_order_count >= {MIN_LIQUIDITY_ORDER_COUNT}
+            """,
+            [station_id] + list(type_ids),
+        ).fetchall()
+        best: dict[int, dict] = {}
+        for type_id, sell_min, sell_percentile in rows:
+            price = sell_percentile if sell_percentile is not None else sell_min
+            if price is not None:
+                best[type_id] = {"price": price}
+        return best
+    finally:
+        conn.close()
+
+
+def get_or_fetch_station_prices(type_ids: list[int], station_id: int, db_path: Path = DB_PATH) -> dict[int, dict]:
+    """Like get_or_fetch_prices() but for a single station -- covers
+    components/reaction materials that aren't part of the bulk ore/mineral
+    station refresh, fetching live (once) for whatever isn't cached yet."""
+    if not type_ids:
+        return {}
+    conn = db.connect(db_path)
+    try:
+        _ensure_station_table(conn)
+        placeholders = ",".join("?" for _ in type_ids)
+        cached = {
+            row[0]
+            for row in conn.execute(
+                f"SELECT DISTINCT type_id FROM station_prices WHERE station_id = ? AND type_id IN ({placeholders})",
+                [station_id] + list(type_ids),
+            ).fetchall()
+        }
+        missing = [t for t in type_ids if t not in cached]
+        if missing:
+            fetched_at = time.time()
+            for chunk in _chunked(missing, _CHUNK_SIZE):
+                resp = requests.get(
+                    AGGREGATES_URL,
+                    params={"station": station_id, "types": ",".join(map(str, chunk))},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                rows = _parse_aggregates_rows(station_id, chunk, resp.json(), fetched_at)
+                conn.executemany(
+                    """
+                    INSERT INTO station_prices
+                        (station_id, type_id, sell_min, sell_percentile, sell_volume,
+                         sell_order_count, buy_max, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(station_id, type_id) DO UPDATE SET
+                        sell_min=excluded.sell_min,
+                        sell_percentile=excluded.sell_percentile,
+                        sell_volume=excluded.sell_volume,
+                        sell_order_count=excluded.sell_order_count,
+                        buy_max=excluded.buy_max,
+                        fetched_at=excluded.fetched_at
+                    """,
+                    rows,
+                )
+                conn.commit()
+    finally:
+        conn.close()
+    return best_station_prices(type_ids, station_id, db_path)
+
+
+def best_multi_station_prices(
+    type_ids: list[int], station_ids: list[int], db_path: Path = DB_PATH
+) -> dict[int, dict]:
+    """Cheapest cached sell price for each type_id, pooled across several
+    stations: {type_id: {"price": float, "location_name": str}} where
+    location_name is whichever *specific* station in the list was cheapest
+    for that item (from HUB_STATION_IDS's reverse mapping)."""
+    if not type_ids or not station_ids:
+        return {}
+    station_names = {sid: name for name, sid in HUB_STATION_IDS.items() if sid in station_ids}
+    conn = db.connect(db_path)
+    try:
+        _ensure_station_table(conn)
+        type_placeholders = ",".join("?" for _ in type_ids)
+        station_placeholders = ",".join("?" for _ in station_ids)
+        rows = conn.execute(
+            f"""
+            SELECT type_id, station_id, sell_min, sell_percentile
+            FROM station_prices
+            WHERE station_id IN ({station_placeholders}) AND type_id IN ({type_placeholders})
+              AND sell_volume >= {MIN_LIQUIDITY_VOLUME}
+              AND sell_order_count >= {MIN_LIQUIDITY_ORDER_COUNT}
+            """,
+            list(station_ids) + list(type_ids),
+        ).fetchall()
+        best: dict[int, dict] = {}
+        for type_id, station_id, sell_min, sell_percentile in rows:
+            price = sell_percentile if sell_percentile is not None else sell_min
+            if price is None:
+                continue
+            current = best.get(type_id)
+            if current is None or price < current["price"]:
+                best[type_id] = {"price": price, "location_name": station_names.get(station_id, str(station_id))}
+        return best
+    finally:
+        conn.close()
+
+
+def get_or_fetch_multi_station_prices(
+    type_ids: list[int], station_ids: list[int], db_path: Path = DB_PATH
+) -> dict[int, dict]:
+    """Like get_or_fetch_station_prices() but pooled across several stations
+    -- covers components/reaction materials not part of the bulk refresh."""
+    if not type_ids or not station_ids:
+        return {}
+    for station_id in station_ids:
+        get_or_fetch_station_prices(type_ids, station_id, db_path)  # ensures each is cached
+    return best_multi_station_prices(type_ids, station_ids, db_path)
 
 
 def refresh_prices(db_path: Path = DB_PATH) -> int:

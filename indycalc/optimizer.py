@@ -18,14 +18,23 @@ Required materials fall into two buckets, handled differently:
 """
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from scipy.optimize import Bounds, LinearConstraint, milp
 
-from indycalc import blueprint_calc, db
-from indycalc.price_cache import MINERAL_TYPE_IDS, best_prices, get_or_fetch_prices
+from indycalc import blueprint_calc, db, price_cache, production_chain
+from indycalc.price_cache import (
+    MINERAL_TYPE_IDS,
+    best_prices,
+    best_station_prices,
+    get_or_fetch_prices,
+    get_or_fetch_station_prices,
+)
+from indycalc.production_chain import BuildDecision
 from indycalc.sde_loader import DB_PATH
 
 REPROCESS_BATCH_FALLBACK = 100
@@ -46,7 +55,7 @@ class OrePurchase:
     tier: str
     quantity: int
     unit_price: float
-    region_name: str
+    location_name: str  # a region name, or a station name when buying from a single station
     cost: float
     volume_m3: float
 
@@ -57,9 +66,62 @@ class ComponentPurchase:
     type_name: str
     quantity: int
     unit_price: float
-    region_name: str
+    location_name: str
     cost: float
     volume_m3: float
+
+
+@dataclass
+class PriceSource:
+    """Abstracts "where do prices come from" so _optimize_ore/_price_components
+    don't need to know whether they're pricing across a region, a single
+    station, or several pooled stations -- same MILP either way, different
+    lookup. `label` is the uniform location shown for single-location
+    sources; a pooled multi-station source instead returns a per-item
+    "location_name" (which specific station in the pool was cheapest for
+    that item), which takes priority over `label` when present."""
+    label: str
+    bulk: Callable[[list[int]], dict[int, dict]]  # ore/mineral type_ids, pre-cached
+    any: Callable[[list[int]], dict[int, dict]]  # arbitrary type_ids, fetches on demand
+
+    def bulk_prices(self, type_ids: list[int]) -> dict[int, dict]:
+        return {
+            tid: {"price": info["price"], "location_name": info.get("location_name", self.label)}
+            for tid, info in self.bulk(type_ids).items()
+        }
+
+    def any_prices(self, type_ids: list[int]) -> dict[int, dict]:
+        return {
+            tid: {"price": info["price"], "location_name": info.get("location_name", self.label)}
+            for tid, info in self.any(type_ids).items()
+        }
+
+
+def region_price_source(db_path: Path, region_names: list[str] | None) -> PriceSource:
+    label = region_names[0] if region_names else "Cheapest overall"
+    return PriceSource(
+        label=label,
+        bulk=lambda ids: best_prices(ids, db_path, region_names=region_names),
+        any=lambda ids: get_or_fetch_prices(ids, db_path, region_names=region_names),
+    )
+
+
+def station_price_source(db_path: Path, station_id: int, station_label: str) -> PriceSource:
+    return PriceSource(
+        label=station_label,
+        bulk=lambda ids: best_station_prices(ids, station_id, db_path),
+        any=lambda ids: get_or_fetch_station_prices(ids, station_id, db_path),
+    )
+
+
+def multi_station_price_source(db_path: Path, station_ids: list[int]) -> PriceSource:
+    """Pools several stations -- each item is priced at whichever station in
+    the list is cheapest for it, tagged with that specific station's name."""
+    return PriceSource(
+        label="",  # unused: best_multi_station_prices always returns a per-item location_name
+        bulk=lambda ids: price_cache.best_multi_station_prices(ids, station_ids, db_path),
+        any=lambda ids: price_cache.get_or_fetch_multi_station_prices(ids, station_ids, db_path),
+    )
 
 
 @dataclass
@@ -73,8 +135,8 @@ class OptimizationResult:
     total_waste_isk: float
     infeasible_reason: str | None = None
     component_purchases: list[ComponentPurchase] = field(default_factory=list)
-    unpriced_components: dict[int, int] = field(default_factory=dict)
     total_volume_m3: float = 0.0
+    build_decisions: list[BuildDecision] = field(default_factory=list)
 
 
 def _empty_result(required: dict[int, int], reason: str) -> OptimizationResult:
@@ -131,7 +193,7 @@ def _optimize_ore(
     mineral_required: dict[int, int],
     refine_pct: dict[str, float],
     db_path: Path,
-    region_names: list[str] | None,
+    price_source: PriceSource,
     ore_mode: str,
     allow_direct_minerals: bool,
 ):
@@ -147,7 +209,7 @@ def _optimize_ore(
 
     ore_type_ids = [o[0] for o in ores]
     base_yields = _load_yields(ore_type_ids, db_path)
-    ore_prices = best_prices(ore_type_ids, db_path, region_names=region_names)
+    ore_prices = price_source.bulk_prices(ore_type_ids)
     # A rare mineral (e.g. Morphite) may only come from an expensive/thin ore
     # (Mercoxit): reprocessing a whole 100-unit portion just to cover a
     # required qty of 1 can cost vastly more than simply buying that 1 unit
@@ -174,7 +236,7 @@ def _optimize_ore(
     n_ore_candidates = len(candidates)
 
     if allow_direct_minerals:
-        mineral_direct_prices = best_prices(mineral_ids, db_path, region_names=region_names)
+        mineral_direct_prices = price_source.bulk_prices(mineral_ids)
         mineral_names = blueprint_calc.material_names(mineral_ids, db_path)
         mineral_volumes = blueprint_calc.material_volumes(mineral_ids, db_path)
         for mat_id in mineral_ids:
@@ -197,8 +259,7 @@ def _optimize_ore(
 
     missing = len(ores) - n_ore_candidates
     if not candidates:
-        where = f" in {region_names[0]}" if region_names else ""
-        return [], 0.0, {}, f"No cached prices for any candidate ore or mineral{where} -- click Refresh Prices first."
+        return [], 0.0, {}, f"No cached prices for any candidate ore or mineral in {price_source.label} -- click Refresh Prices first."
 
     n = len(candidates)
     m = len(mineral_ids)
@@ -239,10 +300,10 @@ def _optimize_ore(
         if batches < 1:
             continue
         qty = batches * portion_size
-        region_name = (
-            mineral_direct_prices[type_id]["region_name"]
+        location_name = (
+            mineral_direct_prices[type_id]["location_name"]
             if tier == "Direct"
-            else ore_prices[type_id]["region_name"]
+            else ore_prices[type_id]["location_name"]
         )
         cost = qty * unit_price
         total_cost += cost
@@ -253,7 +314,7 @@ def _optimize_ore(
                 tier=tier,
                 quantity=qty,
                 unit_price=unit_price,
-                region_name=region_name,
+                location_name=location_name,
                 cost=cost,
                 volume_m3=qty * unit_volume,
             )
@@ -267,13 +328,13 @@ def _optimize_ore(
 def _price_components(
     component_required: dict[int, int],
     db_path: Path,
-    region_names: list[str] | None,
+    price_source: PriceSource,
 ) -> tuple[list[ComponentPurchase], dict[int, int]]:
     component_ids = [tid for tid, qty in component_required.items() if qty > 0]
     if not component_ids:
         return [], {}
 
-    prices = get_or_fetch_prices(component_ids, db_path, region_names=region_names)
+    prices = price_source.any_prices(component_ids)
     names = blueprint_calc.material_names(component_ids, db_path)
     volumes = blueprint_calc.material_volumes(component_ids, db_path)
 
@@ -292,7 +353,7 @@ def _price_components(
                 type_name=names.get(type_id, str(type_id)),
                 quantity=qty,
                 unit_price=price_info["price"],
-                region_name=price_info["region_name"],
+                location_name=price_info["location_name"],
                 cost=cost,
                 volume_m3=qty * volumes.get(type_id, 0.0),
             )
@@ -305,38 +366,98 @@ def optimize(
     refine_pct: dict[str, float],
     db_path: Path = DB_PATH,
     region_names: list[str] | None = None,
+    station_id: int | None = None,
+    station_label: str | None = None,
+    station_ids: list[int] | None = None,
     ore_mode: str = "any",
     allow_direct_minerals: bool = True,
+    allow_build_components: bool = False,
+    allow_build_reactions: bool = False,
+    component_me_percent: float = 0.0,
+    reaction_reduction_percent: float = 0.0,
+    pre_expanded: production_chain.ExpansionResult | None = None,
 ) -> OptimizationResult:
     """Solve for the cheapest way to fill `required` (blueprint materials at
     the chosen ME/runs).
 
-    By default (region_names=None) prices are pulled from the cheapest
-    across *all* cached highsec regions -- the absolute cost minimum, but
-    purchases may be scattered across many stations/regions. Pass a single
-    trade hub's region (e.g. ["The Forge"] for Jita) to restrict the plan to
-    one place, trading a bit of ISK for the convenience of not hauling ore
-    in from all over the map.
+    By default (region_names=None, station_id=None, station_ids=None) prices
+    are pulled from the cheapest across *all* cached highsec regions -- the
+    absolute cost minimum, but purchases may be scattered across many
+    stations/regions. Pass a single trade hub's region (e.g. ["The Forge"]
+    for Jita) to restrict the plan to one region, trading a bit of ISK for
+    the convenience of fewer stops. Pass `station_id` (+ `station_label` for
+    display) instead to price *everything* from one specific station --
+    genuinely one stop, not just one region -- which will be infeasible
+    unless every required item is actually liquid there. Pass `station_ids`
+    (a list) to pool several stations -- each item is priced at whichever of
+    those stations is cheapest for it (see best_station_combo() for
+    searching which N-station combination is cheapest overall).
 
     `ore_mode` controls raw vs. compressed ore sourcing -- see ORE_MODES.
     `allow_direct_minerals=False` forces every mineral to come from ore
     reprocessing, never bought directly on the market.
+    `allow_build_components`/`allow_build_reactions` let non-mineral
+    requirements be built from their own materials instead of always bought
+    directly, when that's cheaper -- see production_chain.py for the (capped
+    at two levels) recursion this expands. That expansion's build-vs-buy
+    decision already uses a region-independent price estimate (see its
+    docstring), so its result doesn't depend on region_names/station_id/
+    station_ids at all -- callers comparing several locations for the same
+    blueprint should compute it once (production_chain.expand_requirements)
+    and pass it in as `pre_expanded` instead of letting every call redo the
+    same expansion (each of which fetches component prices too).
     """
     if ore_mode not in ORE_MODES:
         raise ValueError(f"ore_mode must be one of {ORE_MODES}, got {ore_mode!r}")
+
+    if station_ids is not None:
+        price_source = multi_station_price_source(db_path, station_ids)
+    elif station_id is not None:
+        price_source = station_price_source(db_path, station_id, station_label or str(station_id))
+    else:
+        price_source = region_price_source(db_path, region_names)
+
+    build_decisions: list[BuildDecision] = []
+    if pre_expanded is not None:
+        required = pre_expanded.expanded_required
+        build_decisions = pre_expanded.build_decisions
+    elif allow_build_components or allow_build_reactions:
+        expansion = production_chain.expand_requirements(
+            required,
+            allow_build_components,
+            allow_build_reactions,
+            component_me_percent,
+            reaction_reduction_percent,
+            db_path,
+        )
+        required = expansion.expanded_required
+        build_decisions = expansion.build_decisions
 
     mineral_required = {tid: qty for tid, qty in required.items() if tid in MINERAL_TYPE_IDS}
     component_required = {tid: qty for tid, qty in required.items() if tid not in MINERAL_TYPE_IDS}
 
     ore_purchases, ore_cost, produced, infeasible_reason = _optimize_ore(
-        mineral_required, refine_pct, db_path, region_names, ore_mode, allow_direct_minerals
+        mineral_required, refine_pct, db_path, price_source, ore_mode, allow_direct_minerals
     )
     if infeasible_reason:
         return _empty_result(required, infeasible_reason)
 
     component_purchases, unpriced_components = _price_components(
-        component_required, db_path, region_names
+        component_required, db_path, price_source
     )
+    if unpriced_components:
+        # A component with no price at this location was previously just
+        # dropped from the total -- silently treating "can't buy this here"
+        # as "costs 0 here," which made locations that are actually missing
+        # items look artificially cheap (even "the best place to buy
+        # everything" when they didn't sell everything). Missing coverage
+        # has to make the whole location infeasible, the same way an
+        # uncoverable mineral already does via the MILP.
+        names = blueprint_calc.material_names(list(unpriced_components.keys()), db_path)
+        missing = ", ".join(names.get(tid, str(tid)) for tid in unpriced_components)
+        return _empty_result(
+            required, f"No cached price in {price_source.label} for: {missing} -- click Refresh Prices first."
+        )
     component_cost = sum(p.cost for p in component_purchases)
 
     mineral_ids = sorted(mineral_required)
@@ -362,6 +483,74 @@ def optimize(
         total_waste_isk=sum(waste_isk.values()),
         infeasible_reason=None,
         component_purchases=component_purchases,
-        unpriced_components=unpriced_components,
         total_volume_m3=total_volume_m3,
+        build_decisions=build_decisions,
     )
+
+
+def optimize_many(job_kwargs_list: list[dict]) -> list[OptimizationResult]:
+    """Run several independent optimize() calls and return results in the
+    same order as the input list. Used for comparing many buy locations at
+    once (e.g. the region+station check for every trade hub, or every
+    candidate combination in best_station_combo).
+
+    Deliberately sequential, not threaded. scipy's HiGHS MILP solver has
+    documented segfaults/assertion failures tied to its own internal
+    threading (scipy issues #17220, #17250, #22188), so calling milp() from
+    several Python threads concurrently risks a native-level crash that
+    takes down the whole process with no Python traceback -- confirmed this
+    session as the actual cause of the app dying under exactly this kind of
+    concurrent load. Not worth the speedup; st.cache_data (see app.py) is
+    what actually keeps this from being slow on repeat renders.
+    """
+    return [optimize(**kwargs) for kwargs in job_kwargs_list]
+
+
+@dataclass
+class StationComboResult:
+    station_names: tuple[str, ...]
+    result: OptimizationResult
+
+
+def best_station_combo(
+    required: dict[int, int],
+    refine_pct: dict[str, float],
+    max_stations: int,
+    db_path: Path = DB_PATH,
+    **optimize_kwargs,
+) -> tuple[StationComboResult | None, list[StationComboResult]]:
+    """Try every combination of up to `max_stations` of the 5 known hub
+    stations (small enough to brute-force: at most C(5,1)+...+C(5,5) = 31
+    combos, run in parallel via optimize_many) and return the cheapest
+    feasible one, plus every combo tried (for a "here's what we checked"
+    comparison table).
+
+    Only the 5 major hub stations are candidates -- this tool doesn't have
+    station-level price data for anywhere else, and realistically those are
+    the only stations liquid enough for bulk purchases anyway.
+    """
+    hub_names = list(price_cache.HUB_STATION_IDS)
+    combos = [
+        combo for k in range(1, max_stations + 1) for combo in itertools.combinations(hub_names, k)
+    ]
+    job_kwargs_list = [
+        dict(
+            required=required,
+            refine_pct=refine_pct,
+            db_path=db_path,
+            station_ids=[price_cache.HUB_STATION_IDS[name] for name in combo],
+            **optimize_kwargs,
+        )
+        for combo in combos
+    ]
+    results = optimize_many(job_kwargs_list)
+
+    all_results = [StationComboResult(combo, r) for combo, r in zip(combos, results)]
+    best: StationComboResult | None = None
+    for entry in all_results:
+        if entry.result.infeasible_reason:
+            continue
+        if best is None or entry.result.total_cost < best.result.total_cost:
+            best = entry
+
+    return best, all_results
