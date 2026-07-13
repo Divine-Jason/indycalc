@@ -90,6 +90,47 @@ def cached_comparison_table(
     return pd.DataFrame(rows).sort_values("Total Cost (ISK)", na_position="last")
 
 
+def _merge_for_display(purchases) -> list[dict]:
+    """Collapse purchases to one row per (item, location) for the table --
+    multibuy fills from cheapest orders automatically up to whatever total
+    quantity you enter, so showing e.g. 4 separate rows for the same item
+    at the same location (one per price tier) just to buy one thing is
+    noise, not useful detail. Unit Price becomes a quantity-weighted
+    average; Price Range keeps a hint of the original tier spread (min-max)
+    without needing a row per tier -- the underlying total cost is still
+    the real tier-aware sum, only the display is collapsed."""
+    merged: dict[tuple, dict] = {}
+    for p in purchases:
+        key = (p.type_name, p.location_name)
+        row = merged.setdefault(
+            key,
+            {"name": p.type_name, "tier": getattr(p, "tier", None), "location": p.location_name,
+             "quantity": 0, "cost": 0.0, "volume_m3": 0.0, "min_price": p.unit_price, "max_price": p.unit_price},
+        )
+        row["quantity"] += p.quantity
+        row["cost"] += p.cost
+        row["volume_m3"] += p.volume_m3
+        row["min_price"] = min(row["min_price"], p.unit_price)
+        row["max_price"] = max(row["max_price"], p.unit_price)
+    return list(merged.values())
+
+
+def _multibuy_blocks(result: optimizer.OptimizationResult) -> dict[str, str]:
+    """{location_name: multibuy-paste text}, one block per location -- "Item
+    Name Quantity" per line (EVE's Multi-buy paste format), combining ore/
+    mineral and component purchases. Quantities are summed across every
+    price tier for the same item at the same location, since multibuy just
+    wants a total to fill, not a breakdown of which order supplies it."""
+    totals: dict[str, dict[str, float]] = {}
+    for p in list(result.purchases) + list(result.component_purchases):
+        totals.setdefault(p.location_name, {})
+        totals[p.location_name][p.type_name] = totals[p.location_name].get(p.type_name, 0.0) + p.quantity
+    return {
+        location: "\n".join(f"{name} {int(round(qty))}" for name, qty in sorted(items.items()))
+        for location, items in totals.items()
+    }
+
+
 def _format_duration(seconds: float) -> str:
     if seconds <= 0:
         return "0s"
@@ -190,11 +231,11 @@ with st.sidebar:
         "Limit to at most N stations",
         value=False,
         help=(
-            "Searches every combination of up to N of the 5 hub stations and uses "
-            "whichever combination is cheapest while covering everything -- a "
-            "middle ground between one station (most convenient) and scattering "
-            "across all of highsec (cheapest). Shown in its own section below "
-            "since the search takes a few seconds."
+            "Searches every combination of up to N of the candidate hub stations "
+            "below and uses whichever combination is cheapest while covering "
+            "everything -- a middle ground between one station (most convenient) "
+            "and scattering across all of highsec (cheapest). Shown in its own "
+            "section below since the search takes a few seconds."
         ),
     )
     max_stations_combo = 2
@@ -203,6 +244,20 @@ with st.sidebar:
         selected_region_names = None
         selected_station_id = None
         selected_station_label = None
+
+    combo_candidate_hubs = st.multiselect(
+        "Stations eligible for the combo search",
+        options=list(price_cache.HUB_STATION_IDS),
+        default=list(price_cache.HUB_STATION_IDS),
+        help=(
+            "Which hubs the combo search (above, and the \"Best combo\" section "
+            "shown for \"Cheapest overall\") is allowed to combine. Deselect a hub "
+            "that's numerically cheap but impractical to actually route to -- e.g. "
+            "Amarr is roughly 30 jumps from the other 4 hubs, so a combo that "
+            "includes it can be cheaper on paper while being a much worse shopping "
+            "trip in practice."
+        ),
+    )
 
     st.header("Ore sourcing")
     ore_mode_labels = {
@@ -508,23 +563,29 @@ if show_combo_section:
             "which still reflects the unrestricted scattered result; toggle \"Limit to "
             "at most N stations\" in the sidebar to use this combo as the plan instead."
         )
-    with st.spinner(f"Searching combinations of up to {max_stations_combo} of the 5 hub stations..."):
-        best_combo, all_combo_results = cached_best_station_combo(
-            required,
-            refine_pct,
-            max_stations_combo,
-            ore_mode=ore_mode,
-            allow_direct_minerals=allow_direct_minerals,
-            allow_build_components=allow_build_components,
-            allow_build_reactions=allow_build_reactions,
-            component_me_percent=component_me_percent,
-            reaction_reduction_percent=reaction_reduction_percent,
-            pre_expanded=expansion,
-        )
+    if not combo_candidate_hubs:
+        st.warning("No stations selected under \"Stations eligible for the combo search\" in the sidebar.")
+        best_combo, all_combo_results = None, []
+    else:
+        with st.spinner(f"Searching combinations of up to {max_stations_combo} of {len(combo_candidate_hubs)} candidate stations..."):
+            best_combo, all_combo_results = cached_best_station_combo(
+                required,
+                refine_pct,
+                max_stations_combo,
+                candidate_hubs=combo_candidate_hubs,
+                ore_mode=ore_mode,
+                allow_direct_minerals=allow_direct_minerals,
+                allow_build_components=allow_build_components,
+                allow_build_reactions=allow_build_reactions,
+                component_me_percent=component_me_percent,
+                reaction_reduction_percent=reaction_reduction_percent,
+                pre_expanded=expansion,
+            )
     combo_search = (best_combo, all_combo_results)
 
     if best_combo is None:
-        st.error(f"No combination of up to {max_stations_combo} stations covers every required item.")
+        if combo_candidate_hubs:
+            st.error(f"No combination of up to {max_stations_combo} of the selected stations covers every required item.")
     else:
         st.success(f"Best: {' + '.join(best_combo.station_names)} — {best_combo.result.total_cost:,.2f} ISK")
         ranked = sorted(
@@ -579,24 +640,30 @@ st.subheader(f"Purchase plan — {plan_location}")
 if result.purchases:
     st.markdown("**Ore to buy and reprocess (or mineral to buy directly, when that's cheaper)**")
     st.caption(
-        "Each row is one real sell-order price tier -- if a location's cheap orders "
-        "don't have enough depth to cover the full amount needed, the rest shows up "
-        "as its own row (a higher-priced tier at the same spot, or a different "
-        "ore/grade/location entirely), instead of assuming unlimited quantity at one "
-        "blended price."
+        "One row per item per location -- quantity and cost still reflect real "
+        "sell-order depth (a location without enough cheap depth spills the rest into "
+        "a higher price tier, a different ore/grade, or a different location, same as "
+        "always), just combined here since multibuy fills from cheapest orders "
+        "automatically up to whatever quantity you enter. \"Price Range\" shows the "
+        "spread when more than one tier got combined into this row."
     )
     purchase_df = pd.DataFrame(
         [
             {
-                "Ore / Mineral": p.type_name,
-                "Tier": p.tier,
-                "Quantity": p.quantity,
-                "Location": p.location_name,
-                "Unit Price (ISK)": round(p.unit_price, 2),
-                "Cost (ISK)": round(p.cost, 2),
-                "Volume (m3)": round(p.volume_m3, 2),
+                "Ore / Mineral": row["name"],
+                "Tier": row["tier"],
+                "Quantity": row["quantity"],
+                "Location": row["location"],
+                "Avg Unit Price (ISK)": round(row["cost"] / row["quantity"], 2) if row["quantity"] else 0.0,
+                "Price Range (ISK)": (
+                    f"{row['min_price']:.2f}"
+                    if round(row["min_price"], 2) == round(row["max_price"], 2)
+                    else f"{row['min_price']:.2f} - {row['max_price']:.2f}"
+                ),
+                "Cost (ISK)": round(row["cost"], 2),
+                "Volume (m3)": round(row["volume_m3"], 2),
             }
-            for p in result.purchases
+            for row in _merge_for_display(result.purchases)
         ]
     )
     st.dataframe(purchase_df, hide_index=True, width='stretch')
@@ -607,22 +674,42 @@ if result.component_purchases:
         "These aren't ore-derived, so rather than modeling their own build chain "
         "(reactions, PI, sub-components...) they're just bought outright -- cheapest "
         "real sell-order tier first, spilling into the next tier or location if one "
-        "spot doesn't have enough depth, same as ore above."
+        "spot doesn't have enough depth, same as ore above, combined into one row per "
+        "item per location the same way too."
     )
     component_df = pd.DataFrame(
         [
             {
-                "Component": p.type_name,
-                "Quantity": p.quantity,
-                "Location": p.location_name,
-                "Unit Price (ISK)": round(p.unit_price, 2),
-                "Cost (ISK)": round(p.cost, 2),
-                "Volume (m3)": round(p.volume_m3, 2),
+                "Component": row["name"],
+                "Quantity": row["quantity"],
+                "Location": row["location"],
+                "Avg Unit Price (ISK)": round(row["cost"] / row["quantity"], 2) if row["quantity"] else 0.0,
+                "Price Range (ISK)": (
+                    f"{row['min_price']:.2f}"
+                    if round(row["min_price"], 2) == round(row["max_price"], 2)
+                    else f"{row['min_price']:.2f} - {row['max_price']:.2f}"
+                ),
+                "Cost (ISK)": round(row["cost"], 2),
+                "Volume (m3)": round(row["volume_m3"], 2),
             }
-            for p in result.component_purchases
+            for row in _merge_for_display(result.component_purchases)
         ]
     )
     st.dataframe(component_df, hide_index=True, width='stretch')
+
+if result.purchases or result.component_purchases:
+    st.subheader("Multibuy export")
+    st.caption(
+        "One block per location -- \"Item Name Quantity\" per line, ready to paste "
+        "into EVE's Multi-buy window. Quantities are summed across every price tier "
+        "for the same item at the same location, since multibuy doesn't care which "
+        "specific order fills it, just the total. For \"Cheapest overall\" (region-wide) "
+        "buying, the location shown is the region, not a specific station -- these "
+        "blocks are most directly usable as-is for single-station or station-combo plans."
+    )
+    for location, text in sorted(_multibuy_blocks(result).items()):
+        st.caption(location)
+        st.code(text, language=None)
 
 if result.build_decisions:
     st.subheader("Build vs buy decisions")

@@ -721,23 +721,30 @@ def best_station_combo(
     refine_pct: dict[str, float],
     max_stations: int,
     db_path: Path = DB_PATH,
+    candidate_hubs: list[str] | None = None,
     **optimize_kwargs,
 ) -> tuple[StationComboResult | None, list[StationComboResult]]:
-    """Try every combination of up to `max_stations` of the 5 known hub
+    """Try every combination of up to `max_stations` of the candidate hub
     stations (small enough to brute-force: at most C(5,1)+...+C(5,5) = 31
-    combos, run in parallel via optimize_many) and return the cheapest
-    feasible one, plus every combo tried (for a "here's what we checked"
-    comparison table).
+    combos with all 5, run in parallel via optimize_many) and return the
+    cheapest feasible one, plus every combo tried (for a "here's what we
+    checked" comparison table).
 
-    Only the 5 major hub stations are candidates -- this tool doesn't have
-    station-level price data for anywhere else, and realistically those are
-    the only stations liquid enough for bulk purchases anyway. (An earlier
-    version of this tool could expand the search to stations discovered
-    near a hub, or across all of highsec -- measured taking long enough
-    that it wasn't practical to even time, so it was dropped rather than
-    kept as a "use at your own risk" option.)
+    Only the 5 major hub stations are ever candidates -- this tool doesn't
+    have station-level price data for anywhere else, and realistically
+    those are the only stations liquid enough for bulk purchases anyway.
+    (An earlier version of this tool could expand the search to stations
+    discovered near a hub, or across all of highsec -- measured taking long
+    enough that it wasn't practical to even time, so it was dropped rather
+    than kept as a "use at your own risk" option.)
+
+    Pass `candidate_hubs` (a subset of price_cache.HUB_STATION_IDS's names)
+    to further restrict which of the 5 are even considered -- e.g. a hub
+    that's numerically cheap but many jumps from the others can make a
+    combo that's a poor shopping trip even though it's the cheapest one on
+    paper. Defaults to all 5 hubs.
     """
-    hub_names = list(price_cache.HUB_STATION_IDS)
+    hub_names = [name for name in price_cache.HUB_STATION_IDS if candidate_hubs is None or name in candidate_hubs]
     combos = [
         combo for k in range(1, max_stations + 1) for combo in itertools.combinations(hub_names, k)
     ]
