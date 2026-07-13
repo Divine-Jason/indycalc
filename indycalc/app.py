@@ -508,25 +508,11 @@ if show_combo_section:
             "which still reflects the unrestricted scattered result; toggle \"Limit to "
             "at most N stations\" in the sidebar to use this combo as the plan instead."
         )
-    expand_near_hubs = st.checkbox(
-        "Expand search to include systems near trade hubs",
-        value=False,
-        help=(
-            f"Also considers highsec (>{optimizer.NEARBY_HUB_MIN_SECURITY:.0%} security) "
-            f"systems within {optimizer.NEARBY_HUB_MAX_JUMPS} jumps of a hub. A station "
-            f"there is only actually added as a candidate if real sell-order data shows "
-            f"it offers more than {optimizer.SIGNIFICANT_ISK_SHARE:.0%} of some required "
-            f"mineral's total ISK value at a price better than the 5-hub baseline "
-            f"(capped to the best {optimizer.MAX_DISCOVERED_STATIONS} such stations "
-            f"found, so the combo search itself doesn't explode)."
-        ),
-    )
-    with st.spinner(f"Searching combinations of up to {max_stations_combo} stations..."):
+    with st.spinner(f"Searching combinations of up to {max_stations_combo} of the 5 hub stations..."):
         best_combo, all_combo_results = cached_best_station_combo(
             required,
             refine_pct,
             max_stations_combo,
-            expand_near_hubs=expand_near_hubs,
             ore_mode=ore_mode,
             allow_direct_minerals=allow_direct_minerals,
             allow_build_components=allow_build_components,
@@ -537,39 +523,6 @@ if show_combo_section:
         )
     combo_search = (best_combo, all_combo_results)
 
-    st.checkbox(
-        "Expand search to include all highsec systems -- warning: may take hours to calculate",
-        value=False,
-        key="expand_all_highsec_toggle",
-        help=(
-            "Same real-data check as above, but scans every highsec system in the game "
-            "instead of just those near a hub -- many more regions need a real "
-            "order-book check, which is what makes this slow. Only runs when you click "
-            "the button below, and only ever adds stations that clear the same "
-            f">{optimizer.SIGNIFICANT_ISK_SHARE:.0%}-of-ISK-value bar as above."
-        ),
-    )
-    if st.session_state.get("expand_all_highsec_toggle"):
-        if st.button("Run all-highsec search (may take hours)"):
-            with st.spinner("Scanning every highsec region for significant price advantages -- this can take a long time..."):
-                best_combo_all, all_combo_results_all = cached_best_station_combo(
-                    required,
-                    refine_pct,
-                    max_stations_combo,
-                    expand_all_highsec=True,
-                    ore_mode=ore_mode,
-                    allow_direct_minerals=allow_direct_minerals,
-                    allow_build_components=allow_build_components,
-                    allow_build_reactions=allow_build_reactions,
-                    component_me_percent=component_me_percent,
-                    reaction_reduction_percent=reaction_reduction_percent,
-                    pre_expanded=expansion,
-                )
-            st.session_state["combo_search_all_highsec"] = (best_combo_all, all_combo_results_all)
-        if st.session_state.get("combo_search_all_highsec"):
-            combo_search = st.session_state["combo_search_all_highsec"]
-
-    best_combo, all_combo_results = combo_search
     if best_combo is None:
         st.error(f"No combination of up to {max_stations_combo} stations covers every required item.")
     else:

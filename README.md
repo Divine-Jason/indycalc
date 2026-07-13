@@ -217,20 +217,16 @@ candidate stations and uses whichever combination is cheapest while covering eve
 required item -- a ranked table of the combos tried, and the winning plan tagged with
 exactly which station to buy each item at.
 
-By default the only candidates are the 5 major hub stations (at most
-C(5,1)+...+C(5,5) = 31 combos). Two checkboxes expand that:
-
-- **"Expand search to include systems near trade hubs"**: also considers highsec
-  (>50% security) systems within 5 jumps of a hub. A station there only actually gets
-  added as a candidate if real sell-order data shows it offers more than 10% of some
-  required mineral's total ISK value at a price better than the 5-hub baseline --
-  capped to the best 5 such stations found, so the combo search itself can't explode.
-  Runs automatically alongside the rest of the page (it's fast enough now that it
-  doesn't need its own button).
-- **"Expand search to include all highsec systems"**: the same real-data check, but
-  across every highsec system in the game instead of just those near a hub -- far more
-  regions need a real order-book check, so this is explicitly gated behind its own
-  button and can take a long time (potentially hours on a cold cache).
+The only candidates are the 5 major hub stations (at most C(5,1)+...+C(5,5) = 31
+combos) -- deliberately not expandable to other stations. An earlier version of this
+tool could widen the search to stations discovered near a hub, or across all of
+highsec, using a real-data check (only add a station if it's actually significantly
+cheaper for a meaningful chunk of what's needed) to keep the extra candidates
+reasonable. In testing, even the narrower "near a hub" version took long enough to be
+impractical, and the "all of highsec" version took long enough that it wasn't
+practical to even time -- likely hours to days, by which point the market data behind
+the result would be stale anyway. Both were dropped rather than kept as a "use at your
+own risk" option.
 
 ## Job installation cost, BPC copying, and build time
 

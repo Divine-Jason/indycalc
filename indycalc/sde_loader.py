@@ -98,14 +98,6 @@ def load_sde(db_path: Path = DB_PATH) -> None:
         jumps.columns = ["from_system_id", "to_system_id"]
         jumps.to_sql("system_jumps", conn, if_exists="replace", index=False)
 
-        print("Fetching staStations.csv (NPC station names/locations -- for naming stations "
-              "discovered near a trade hub, beyond the 5 hardcoded hub stations) ...")
-        stations = _fetch_csv("staStations")[
-            ["stationID", "stationName", "solarSystemID", "regionID"]
-        ]
-        stations.columns = ["station_id", "station_name", "solar_system_id", "region_id"]
-        stations.to_sql("stations", conn, if_exists="replace", index=False)
-
         print("Deriving ore tier table from ore_tiers.py ...")
         asteroid_group_ids = set(inv_groups[inv_groups["categoryID"] == ASTEROID_CATEGORY_ID]["groupID"])
         ore_names = inv_types[
@@ -149,9 +141,6 @@ def load_sde(db_path: Path = DB_PATH) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_system_jumps_from ON system_jumps(from_system_id)"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_stations_system ON stations(solar_system_id)"
-        )
         conn.commit()
 
         for table in [
@@ -165,7 +154,6 @@ def load_sde(db_path: Path = DB_PATH) -> None:
             "regions",
             "solar_systems",
             "system_jumps",
-            "stations",
             "ore_tiers",
         ]:
             count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]

@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import itertools
 import math
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -148,62 +147,21 @@ def station_price_source(db_path: Path, station_id: int, station_label: str) -> 
     )
 
 
-def multi_station_price_source(
-    db_path: Path, station_ids: list[int], extra_station_names: dict[int, str] | None = None
-) -> PriceSource:
+def multi_station_price_source(db_path: Path, station_ids: list[int]) -> PriceSource:
     """Pools several stations -- each item is priced at whichever station in
-    the list is cheapest for it, tagged with that specific station's name.
-
-    Not restricted to the 5 known hubs -- also used for combo searches
-    expanded to include stations discovered near a hub or across highsec
-    (see best_station_combo's expand_* params); `extra_station_names`
-    supplies display names for those (they're not in HUB_STATION_IDS). For
-    a known hub, the ranking prefilter uses that station's own cached
-    aggregate (precise); for any other station, it falls back to that
-    station's *region*-level aggregate instead -- there's no per-station
-    Fuzzworks refresh for arbitrary stations, but region-level is still a
-    fine "worth a real check" signal, just slightly coarser.
-    """
-    known_hub_ids = set(price_cache.HUB_STATION_IDS.values())
-    hub_ids = [sid for sid in station_ids if sid in known_hub_ids]
-    other_ids = [sid for sid in station_ids if sid not in known_hub_ids]
-
-    station_names = {sid: name for name, sid in price_cache.HUB_STATION_IDS.items() if sid in hub_ids}
-    station_names.update({sid: name for sid, name in (extra_station_names or {}).items() if sid in other_ids})
-
-    other_region_ids = price_cache.region_ids_for_stations(other_ids, db_path)
-    other_region_names = price_cache.region_names_for_ids(other_region_ids, db_path)
+    the list is cheapest for it, tagged with that specific station's name."""
+    station_names = {sid: name for name, sid in price_cache.HUB_STATION_IDS.items() if sid in station_ids}
     region_ids = [
-        rid for rid in (price_cache.station_region_id(sid, db_path) for sid in hub_ids) if rid is not None
-    ] + other_region_ids
-
-    def _merge_cheapest(a: dict[int, dict], b: dict[int, dict]) -> dict[int, dict]:
-        merged = dict(a)
-        for tid, info in b.items():
-            if tid not in merged or info["price"] < merged[tid]["price"]:
-                merged[tid] = info
-        return merged
-
-    def prefilter_bulk(ids: list[int]) -> dict[int, dict]:
-        result = price_cache.best_multi_station_prices(ids, hub_ids, db_path) if hub_ids else {}
-        if other_region_names:
-            result = _merge_cheapest(result, price_cache.best_prices(ids, db_path, region_names=other_region_names))
-        return result
-
-    def prefilter_any(ids: list[int]) -> dict[int, dict]:
-        result = price_cache.get_or_fetch_multi_station_prices(ids, hub_ids, db_path) if hub_ids else {}
-        if other_region_names:
-            result = _merge_cheapest(
-                result, price_cache.get_or_fetch_prices(ids, db_path, region_names=other_region_names)
-            )
-        return result
-
+        rid
+        for rid in (price_cache.station_region_id(sid, db_path) for sid in station_ids)
+        if rid is not None
+    ]
     return PriceSource(
         label="",  # unused: every tier is tagged with a specific station via location_names
         region_ids=region_ids,
         location_filter=set(station_ids),
-        prefilter_bulk=prefilter_bulk,
-        prefilter_any=prefilter_any,
+        prefilter_bulk=lambda ids: price_cache.best_multi_station_prices(ids, station_ids, db_path),
+        prefilter_any=lambda ids: price_cache.get_or_fetch_multi_station_prices(ids, station_ids, db_path),
         location_names=station_names,
     )
 
@@ -615,7 +573,6 @@ def optimize(
     station_id: int | None = None,
     station_label: str | None = None,
     station_ids: list[int] | None = None,
-    station_names: dict[int, str] | None = None,
     ore_mode: str = "any",
     allow_direct_minerals: bool = True,
     allow_build_components: bool = False,
@@ -638,9 +595,7 @@ def optimize(
     unless every required item is actually liquid there. Pass `station_ids`
     (a list) to pool several stations -- each item is priced at whichever of
     those stations is cheapest for it (see best_station_combo() for
-    searching which N-station combination is cheapest overall). `station_names`
-    supplies display names for any of `station_ids` beyond the 5 known hubs
-    (used when best_station_combo() has expanded the search).
+    searching which N-station combination is cheapest overall).
 
     `ore_mode` controls raw vs. compressed ore sourcing -- see ORE_MODES.
     `allow_direct_minerals=False` forces every mineral to come from ore
@@ -660,7 +615,7 @@ def optimize(
         raise ValueError(f"ore_mode must be one of {ORE_MODES}, got {ore_mode!r}")
 
     if station_ids is not None:
-        price_source = multi_station_price_source(db_path, station_ids, station_names)
+        price_source = multi_station_price_source(db_path, station_ids)
     elif station_id is not None:
         price_source = station_price_source(db_path, station_id, station_label or str(station_id))
     else:
@@ -755,184 +710,6 @@ def optimize_many(job_kwargs_list: list[dict]) -> list[OptimizationResult]:
     return [optimize(**kwargs) for kwargs in job_kwargs_list]
 
 
-# "Expand search" scope for best_station_combo(): how far from a hub counts
-# as "nearby" (jump-distance, highsec-only routing -- mirrors job_cost.py's
-# "secure jumps" pattern) and how good a discovered station has to be to be
-# worth adding as a combo candidate.
-NEARBY_HUB_MAX_JUMPS = 5
-NEARBY_HUB_MIN_SECURITY = 0.5
-SIGNIFICANT_ISK_SHARE = 0.10
-# Cap on extra (non-hub) stations added to the combo search -- otherwise a
-# generous discovery pass could make the C(n, k) combination count explode.
-MAX_DISCOVERED_STATIONS = 5
-# Cap on how many ore/mineral candidates per required mineral get a real
-# order-book check during discovery -- this search can span many more
-# regions than the standard 5-hub one, so it's capped by candidate count
-# (ranked cheapest-surface-price-first) rather than checking everything.
-MAX_DISCOVERY_CANDIDATES_PER_MINERAL = 8
-
-
-def _hub_system_ids(db_path: Path) -> list[int]:
-    conn = db.connect(db_path)
-    try:
-        placeholders = ",".join("?" for _ in price_cache.HUB_STATION_IDS)
-        rows = conn.execute(
-            f"SELECT solar_system_id FROM stations WHERE station_id IN ({placeholders})",
-            list(price_cache.HUB_STATION_IDS.values()),
-        ).fetchall()
-        return [r[0] for r in rows]
-    finally:
-        conn.close()
-
-
-def _systems_within_jumps(
-    start_system_ids: list[int], max_jumps: int | None, min_security: float, db_path: Path
-) -> set[int]:
-    """Multi-source BFS from `start_system_ids`, restricted to systems (and
-    the edges between them) with security > min_security -- mirrors
-    job_cost.recommend_build_systems()'s "secure jumps" pattern.
-    `max_jumps=None` means unbounded (every qualifying system, used for the
-    "all highsec" expansion rather than a jump-distance-limited one)."""
-    conn = db.connect(db_path)
-    try:
-        qualifying = {
-            row[0]
-            for row in conn.execute(
-                "SELECT system_id FROM solar_systems WHERE security > ?", (min_security,)
-            ).fetchall()
-        }
-        if max_jumps is None:
-            return qualifying
-
-        edges = conn.execute("SELECT from_system_id, to_system_id FROM system_jumps").fetchall()
-        adjacency: dict[int, list[int]] = {}
-        for a, b in edges:
-            if a in qualifying and b in qualifying:
-                adjacency.setdefault(a, []).append(b)
-                adjacency.setdefault(b, []).append(a)
-
-        jumps_from_start: dict[int, int] = {sid: 0 for sid in start_system_ids if sid in qualifying}
-        queue: deque[int] = deque(jumps_from_start)
-        while queue:
-            current = queue.popleft()
-            if jumps_from_start[current] >= max_jumps:
-                continue
-            for neighbor in adjacency.get(current, []):
-                if neighbor not in jumps_from_start:
-                    jumps_from_start[neighbor] = jumps_from_start[current] + 1
-                    queue.append(neighbor)
-        return set(jumps_from_start)
-    finally:
-        conn.close()
-
-
-def _stations_in_systems(system_ids: set[int], db_path: Path) -> dict[int, tuple[str, int]]:
-    """{station_id: (station_name, region_id)} for every NPC station in `system_ids`."""
-    if not system_ids:
-        return {}
-    conn = db.connect(db_path)
-    try:
-        placeholders = ",".join("?" for _ in system_ids)
-        rows = conn.execute(
-            f"SELECT station_id, station_name, region_id FROM stations WHERE solar_system_id IN ({placeholders})",
-            list(system_ids),
-        ).fetchall()
-        return {r[0]: (r[1], r[2]) for r in rows}
-    finally:
-        conn.close()
-
-
-@dataclass
-class DiscoveredStation:
-    station_id: int
-    name: str
-    isk_share: float  # largest single-mineral ISK share found, for ranking/capping
-
-
-def _discover_significant_stations(
-    required: dict[int, int],
-    refine_pct: dict[str, float],
-    db_path: Path,
-    ore_mode: str,
-    candidate_stations: dict[int, tuple[str, int]],
-) -> list[DiscoveredStation]:
-    """Real-data check: which of `candidate_stations` are worth adding to
-    the combo search -- offering more than SIGNIFICANT_ISK_SHARE of some
-    required mineral's total ISK value at a price better than the standard
-    5-hub baseline. This is the expensive step (real per-region ESI
-    fetches), scoped to just the regions the candidates are actually in --
-    the number of *distinct regions* those stations sit in, not the number
-    of stations, is what drives cost here."""
-    if not candidate_stations:
-        return []
-    mineral_ids = sorted(mid for mid, qty in required.items() if qty > 0 and mid in price_cache.MINERAL_TYPE_IDS)
-    if not mineral_ids:
-        return []
-
-    baseline = price_cache.best_multi_station_prices(
-        mineral_ids, list(price_cache.HUB_STATION_IDS.values()), db_path
-    )
-    baseline_prices = {mid: info["price"] for mid, info in baseline.items()}
-    if not baseline_prices:
-        return []
-
-    region_ids = sorted({region_id for _, region_id in candidate_stations.values()})
-    location_filter = set(candidate_stations)
-    region_names = price_cache.region_names_for_ids(region_ids, db_path)
-
-    ores = _load_relevant_ores(set(mineral_ids), db_path, ore_mode)
-    base_yields = _load_yields([o[0] for o in ores], db_path)
-    virtual_candidates = _build_virtual_candidates(ores, base_yields, refine_pct, mineral_ids, True, db_path)
-
-    # This can span many more regions than the standard 5-hub search (every
-    # region a nearby/highsec station happens to be in), so real fetches are
-    # capped to the top-ranked candidates per mineral -- same cheap-surface-
-    # price-first idea as _optimize_ore's lazy expansion, just a fixed cap
-    # instead of adaptive rounds, since "is anything here notably cheaper"
-    # doesn't need the same completeness guarantee as an actual purchase plan.
-    surface_prices = price_cache.get_or_fetch_prices(list(virtual_candidates), db_path, region_names=region_names)
-    ranked_by_mineral = _rank_candidates_per_mineral(virtual_candidates, surface_prices, mineral_ids)
-    to_check: set[int] = set()
-    for mineral_id in mineral_ids:
-        to_check.update(ranked_by_mineral.get(mineral_id, [])[:MAX_DISCOVERY_CANDIDATES_PER_MINERAL])
-
-    tiers = order_book.get_tiers(list(to_check), region_ids, location_filter, db_path)
-
-    # ISK value each station contributes toward each mineral, counting only
-    # depth priced *below* that mineral's 5-hub baseline (a station that's
-    # more expensive than the hubs isn't "significant," it's just present).
-    contribution: dict[int, dict[int, float]] = {}
-    for type_id, price_tiers in tiers.items():
-        cand = virtual_candidates[type_id]
-        for price_tier in price_tiers:
-            for mineral_id, y in cand.yield_row.items():
-                if y <= 0:
-                    continue
-                baseline_price = baseline_prices.get(mineral_id)
-                if baseline_price is None or price_tier.price >= baseline_price:
-                    continue
-                isk_value = price_tier.max_qty * y * price_tier.price
-                station_map = contribution.setdefault(price_tier.location_id, {})
-                station_map[mineral_id] = station_map.get(mineral_id, 0.0) + isk_value
-
-    discovered: list[DiscoveredStation] = []
-    for station_id, mineral_contribs in contribution.items():
-        if station_id not in candidate_stations:
-            continue  # a real order can sit at a location outside our candidate set
-        best_share = 0.0
-        for mineral_id, isk_value in mineral_contribs.items():
-            total_value = required[mineral_id] * baseline_prices.get(mineral_id, 0.0)
-            if total_value <= 0:
-                continue
-            best_share = max(best_share, isk_value / total_value)
-        if best_share > SIGNIFICANT_ISK_SHARE:
-            name, _ = candidate_stations[station_id]
-            discovered.append(DiscoveredStation(station_id, name, best_share))
-
-    discovered.sort(key=lambda d: -d.isk_share)
-    return discovered[:MAX_DISCOVERED_STATIONS]
-
-
 @dataclass
 class StationComboResult:
     station_names: tuple[str, ...]
@@ -944,60 +721,32 @@ def best_station_combo(
     refine_pct: dict[str, float],
     max_stations: int,
     db_path: Path = DB_PATH,
-    expand_near_hubs: bool = False,
-    expand_all_highsec: bool = False,
-    ore_mode: str = "any",
     **optimize_kwargs,
 ) -> tuple[StationComboResult | None, list[StationComboResult]]:
-    """Try every combination of up to `max_stations` of the candidate
-    stations (brute-force -- see below for why this stays small) and
-    return the cheapest feasible one, plus every combo tried (for a
-    "here's what we checked" comparison table).
+    """Try every combination of up to `max_stations` of the 5 known hub
+    stations (small enough to brute-force: at most C(5,1)+...+C(5,5) = 31
+    combos, run in parallel via optimize_many) and return the cheapest
+    feasible one, plus every combo tried (for a "here's what we checked"
+    comparison table).
 
-    By default, candidates are strictly the 5 known trade hub stations (at
-    most C(5,1)+...+C(5,5) = 31 combos) -- this tool doesn't have real
-    per-station data anywhere else without asking for it, and realistically
-    those are the only stations liquid enough for bulk purchases anyway.
-
-    `expand_near_hubs=True` also considers highsec (security > 0.5) systems
-    within NEARBY_HUB_MAX_JUMPS of a hub; `expand_all_highsec=True`
-    considers every highsec system in the game instead (can take a long
-    time -- many more regions need a real order-book check). In both cases,
-    a discovered station only actually gets added as a combo candidate if
-    it passes `_discover_significant_stations`' real-data check (offering
-    more than SIGNIFICANT_ISK_SHARE of some mineral's ISK value at a price
-    better than the 5-hub baseline), capped to MAX_DISCOVERED_STATIONS --
-    otherwise a generous discovery pass could make the combo count explode.
+    Only the 5 major hub stations are candidates -- this tool doesn't have
+    station-level price data for anywhere else, and realistically those are
+    the only stations liquid enough for bulk purchases anyway. (An earlier
+    version of this tool could expand the search to stations discovered
+    near a hub, or across all of highsec -- measured taking long enough
+    that it wasn't practical to even time, so it was dropped rather than
+    kept as a "use at your own risk" option.)
     """
-    candidate_stations: dict[str, int] = dict(price_cache.HUB_STATION_IDS)
-
-    if expand_near_hubs or expand_all_highsec:
-        if expand_all_highsec:
-            system_ids = _systems_within_jumps([], None, NEARBY_HUB_MIN_SECURITY, db_path)
-        else:
-            system_ids = _systems_within_jumps(
-                _hub_system_ids(db_path), NEARBY_HUB_MAX_JUMPS, NEARBY_HUB_MIN_SECURITY, db_path
-            )
-        stations_in_range = _stations_in_systems(system_ids, db_path)
-        known_hub_ids = set(price_cache.HUB_STATION_IDS.values())
-        stations_in_range = {sid: info for sid, info in stations_in_range.items() if sid not in known_hub_ids}
-        for discovered in _discover_significant_stations(required, refine_pct, db_path, ore_mode, stations_in_range):
-            candidate_stations[discovered.name] = discovered.station_id
-
-    station_ids_by_name = candidate_stations
-    station_display_names = {sid: name for name, sid in candidate_stations.items()}
-    combo_names = list(candidate_stations)
+    hub_names = list(price_cache.HUB_STATION_IDS)
     combos = [
-        combo for k in range(1, max_stations + 1) for combo in itertools.combinations(combo_names, k)
+        combo for k in range(1, max_stations + 1) for combo in itertools.combinations(hub_names, k)
     ]
     job_kwargs_list = [
         dict(
             required=required,
             refine_pct=refine_pct,
             db_path=db_path,
-            ore_mode=ore_mode,
-            station_ids=[station_ids_by_name[name] for name in combo],
-            station_names=station_display_names,
+            station_ids=[price_cache.HUB_STATION_IDS[name] for name in combo],
             **optimize_kwargs,
         )
         for combo in combos

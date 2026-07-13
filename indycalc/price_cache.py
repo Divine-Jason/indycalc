@@ -474,38 +474,6 @@ def station_region_id(station_id: int, db_path: Path = DB_PATH) -> int | None:
         conn.close()
 
 
-def region_ids_for_stations(station_ids: list[int], db_path: Path = DB_PATH) -> list[int]:
-    """region_id for each of `station_ids`, via the `stations` table (any
-    NPC station, not just the 5 known hubs) -- used for combo searches
-    expanded beyond the hubs (see optimizer.best_station_combo)."""
-    if not station_ids:
-        return []
-    conn = db.connect(db_path)
-    try:
-        placeholders = ",".join("?" for _ in station_ids)
-        rows = conn.execute(
-            f"SELECT DISTINCT region_id FROM stations WHERE station_id IN ({placeholders})",
-            station_ids,
-        ).fetchall()
-        return [r[0] for r in rows]
-    finally:
-        conn.close()
-
-
-def region_names_for_ids(region_ids: list[int], db_path: Path = DB_PATH) -> list[str]:
-    if not region_ids:
-        return []
-    conn = db.connect(db_path)
-    try:
-        placeholders = ",".join("?" for _ in region_ids)
-        rows = conn.execute(
-            f"SELECT region_name FROM regions WHERE region_id IN ({placeholders})", region_ids
-        ).fetchall()
-        return [r[0] for r in rows]
-    finally:
-        conn.close()
-
-
 def last_refreshed(db_path: Path = DB_PATH) -> float | None:
     conn = db.connect(db_path)
     try:
