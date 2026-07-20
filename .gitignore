@@ -17,3 +17,6 @@ env/
 
 # Streamlit
 .streamlit/
+
+# Release build output
+*.zip
