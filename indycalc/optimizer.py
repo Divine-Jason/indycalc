@@ -602,8 +602,8 @@ def optimize(
     reprocessing, never bought directly on the market.
     `allow_build_components`/`allow_build_reactions` let non-mineral
     requirements be built from their own materials instead of always bought
-    directly, when that's cheaper -- see production_chain.py for the (capped
-    at two levels) recursion this expands. That expansion's build-vs-buy
+    directly, when that's cheaper -- see production_chain.py for the
+    recursion this expands. That expansion's build-vs-buy
     decision already uses a region-independent price estimate (see its
     docstring), so its result doesn't depend on region_names/station_id/
     station_ids at all -- callers comparing several locations for the same

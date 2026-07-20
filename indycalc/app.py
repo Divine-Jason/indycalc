@@ -508,12 +508,17 @@ if not required:
     st.stop()
 
 mat_names = blueprint_calc.material_names(list(required.keys()))
+# "Component (bought directly)" is only accurate when "Craft components
+# myself" is off -- with it on, this is just the blueprint's own top-level
+# requirement list before build-vs-buy runs, not the actual outcome (see the
+# "Build vs buy decisions" table below for that).
+component_label = "Component (bought directly)" if not allow_build_components else "Component (see build vs buy below)"
 req_df = pd.DataFrame(
     [
         {
             "Material": mat_names.get(mid, str(mid)),
             "Required Qty": qty,
-            "Source": "Ore (reprocessed)" if mid in price_cache.MINERAL_TYPE_IDS else "Component (bought directly)",
+            "Source": "Ore (reprocessed)" if mid in price_cache.MINERAL_TYPE_IDS else component_label,
         }
         for mid, qty in required.items()
     ]
@@ -526,10 +531,41 @@ st.dataframe(req_df, hide_index=True, width='stretch')
 # lookups.
 expansion = None
 if allow_build_components or allow_build_reactions:
-    expansion = cached_expand(
-        required, allow_build_components, allow_build_reactions,
-        component_me_percent, reaction_reduction_percent,
+    with st.spinner(
+        "Pricing components to compare build vs. buy (first run only for any newly-seen "
+        "component, then cached) -- capital ship/structure parts can nest several levels "
+        "deep, so this can take a little while the first time..."
+    ):
+        expansion = cached_expand(
+            required, allow_build_components, allow_build_reactions,
+            component_me_percent, reaction_reduction_percent,
+        )
+
+if expansion is not None and expansion.build_decisions:
+    # Shown up here (rather than after the purchase-plan section below) and
+    # keyed off the region-independent `expansion` rather than `result`, so
+    # it's still visible even if the specific location picked below turns out
+    # infeasible -- e.g. one deeply-nested material with no market anywhere
+    # kills feasibility for every location, but that shouldn't hide the fact
+    # that everything else in the tree *did* resolve to a real build-or-buy
+    # call. Without this, an infeasible location shows nothing but a bare
+    # error, which looks exactly like "craft components myself" did nothing.
+    st.subheader("Build vs buy decisions")
+    decisions_df = pd.DataFrame(
+        [
+            {
+                "Item": d.name,
+                "Decision": d.decision,
+                "Needed": d.needed_qty,
+                "Runs": d.runs or None,
+                "Produced": d.produced_qty or None,
+                "Build Cost (ISK)": round(d.build_cost, 2) if d.build_cost is not None else None,
+                "Buy Cost (ISK)": round(d.buy_cost, 2) if d.buy_cost is not None else None,
+            }
+            for d in expansion.build_decisions
+        ]
     )
+    st.dataframe(decisions_df, hide_index=True, width='stretch')
 
 st.subheader("Compare buying locations")
 st.caption(
@@ -710,24 +746,6 @@ if result.purchases or result.component_purchases:
     for location, text in sorted(_multibuy_blocks(result).items()):
         st.caption(location)
         st.code(text, language=None)
-
-if result.build_decisions:
-    st.subheader("Build vs buy decisions")
-    decisions_df = pd.DataFrame(
-        [
-            {
-                "Item": d.name,
-                "Decision": d.decision,
-                "Needed": d.needed_qty,
-                "Runs": d.runs or None,
-                "Produced": d.produced_qty or None,
-                "Build Cost (ISK)": round(d.build_cost, 2) if d.build_cost is not None else None,
-                "Buy Cost (ISK)": round(d.buy_cost, 2) if d.buy_cost is not None else None,
-            }
-            for d in result.build_decisions
-        ]
-    )
-    st.dataframe(decisions_df, hide_index=True, width='stretch')
 
 col1, col2 = st.columns(2)
 col1.metric("Total material cost", f"{result.total_cost:,.2f} ISK")

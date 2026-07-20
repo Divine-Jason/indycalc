@@ -107,7 +107,12 @@ For each material a blueprint needs (after applying ME% and run count):
   reprocesses into the same minerals as raw but takes roughly 1/100th the cargo volume,
   usually for a small premium -- worth comparing if you're hauling.
 - A single troll sell order (a handful of units at a giveaway price) is ignored --
-  prices only count if there's real listed volume and more than one order behind them.
+  prices only count if there's more than one order behind them. Ore/minerals additionally
+  need real bulk volume listed (they trade in huge lots, so low volume there really does
+  mean "not liquid"). Components don't get that same volume bar -- a capital ship
+  component worth hundreds of millions of ISK will never have thousands of units listed,
+  so requiring that would reject perfectly real markets; order count alone is what
+  screens out a troll listing for those.
 - **A location that's missing a price for anything required makes that whole location
   infeasible, never a silent $0.** This applies everywhere -- a single station, a
   region, or the unrestricted "cheapest overall" scan. Otherwise a station that simply
@@ -169,26 +174,32 @@ session on the app side, so recalculating with the same blueprint/ME/runs shortl
 Off by default (everything is bought). Two independent toggles, each comparing build
 cost vs. buy cost and picking the cheaper:
 
-- **Craft components myself**: a component (e.g. a Tech II item) has its own
-  Manufacturing blueprint. When on, each non-mineral top-level requirement is priced
-  both as "buy it" and as "build it from its own materials at the ME% you set," and
-  whichever wins is used. Minerals pulled in this way are folded into the same ore
-  purchase plan as the ship's own minerals, so they compete for the same bulk buy.
+- **Craft components myself**: a component (e.g. a Tech II item, or a capital
+  ship/structure part) has its own Manufacturing blueprint. When on, every non-mineral
+  Manufacturing product encountered is priced both as "buy it" and as "build it from its
+  own materials at the ME% you set" -- recursively, to whatever depth the item's own
+  production chain actually goes, not just the top level. Capital ship and structure
+  components in particular often nest several Manufacturing levels deep (e.g. a
+  dreadnought's Neurolink Protection Cell needs a Neurolink Enhancer Reservoir, which
+  needs a Programmable Purification Membrane, ...); each level gets its own build-vs-buy
+  call. Minerals pulled in this way are folded into the same ore purchase plan as the
+  ship's own minerals, so they compete for the same bulk buy.
 - **Craft reaction materials myself**: a reaction material (e.g. Fernite Carbide) has
   its own Reaction formula instead of a Manufacturing blueprint, and reactions have no
   ME research -- the % you set represents a refinery Reaction rig bonus instead, if you
-  have one. This only kicks in for reaction materials pulled in *while building a
-  component* (so it does nothing unless "Craft components myself" is also on and finds
+  have one. Unlike Manufacturing products, a reaction formula's own materials are always
+  bought directly, never built further -- reaction inputs (fuel blocks, moon materials,
+  gas, PI) don't have their own producer in the SDE to begin with, so there's nothing
+  deeper to build. This only kicks in for reaction materials pulled in while building a
+  component (so it does nothing unless "Craft components myself" is also on and finds
   something worth building).
 
-**Scope is deliberately capped at these two levels.** Raw reaction inputs (fuel blocks,
-moon materials, gas, PI) and anything nested deeper than that are always bought
-directly -- modeling their own production chains would be a much bigger undertaking.
-Reactions produce in large fixed batches (often thousands of units per run), so
-whether building one is worth it depends heavily on scale: needing a handful of units
-almost always loses to buying, needing enough to fill most of a batch often wins. The
-"Build vs buy decisions" table in the results shows exactly which way each call went
-and why.
+If something genuinely can't be sourced at all -- no market listing anywhere, and (for
+Manufacturing products) nothing it needs can be sourced either, all the way down -- the
+build-vs-buy call for it fails outright rather than silently defaulting to "buy" a thing
+nobody's selling; whatever depends on it will show as unpriced/infeasible instead of a
+misleadingly-cheap number. The "Build vs buy decisions" table in the results shows
+exactly which way each call went and why, including deep in the chain.
 
 The build-vs-buy comparison itself uses a quick, region-independent price estimate
 (not the same batch-optimized ore MILP used for the final purchase plan) -- see the
@@ -325,8 +336,10 @@ from taking several minutes on a cold cache.
 
 - Region-level price aggregation can't exclude the handful of lowsec systems inside an
   otherwise-highsec region.
-- Build-vs-buy for components/reactions is capped at two levels deep (see above) --
-  raw reaction inputs and deeper nested components always buy, never build.
+- Build-vs-buy for Manufacturing products recurses to whatever depth the item's chain
+  actually goes; a Reaction formula's own materials are always bought, never built (see
+  above) -- there's nothing to recurse into there since reaction inputs don't have their
+  own producer in the SDE.
 - The build-vs-buy cost estimate uses direct market prices everywhere (no region
   restriction, no ore-batch optimization), which is a conservative estimate of true
   build cost -- real bulk ore reprocessing is usually cheaper than this estimate

@@ -1,16 +1,20 @@
 """Build-vs-buy expansion for components and reaction materials.
 
-Scope is deliberately capped at two levels, matching the two toggles this
-supports:
-  - A non-mineral *top-level* blueprint requirement may be built from its own
-    Manufacturing blueprint materials (gated by allow_build_components), or
-    from its own Reaction formula materials if it's a raw reaction product
-    required directly (gated by allow_build_reactions).
-  - A non-mineral *sub-material* encountered while building a component may
-    itself be built from its Reaction formula (gated by allow_build_reactions)
-    -- but never recursed into as a further component build.
-Everything below that (fuel blocks, moon materials, gas, PI, deeper nested
-components) is always bought directly. See README for why.
+Two independent toggles:
+  - allow_build_components: any non-mineral Manufacturing product encountered
+    anywhere in the tree -- the top-level requirement itself, or a material
+    several Manufacturing levels below it -- is compared build-vs-buy and
+    recursed into if building wins. Capital ship/structure components can
+    nest several Manufacturing levels deep (e.g. Neurolink Protection Cell ->
+    Neurolink Enhancer Reservoir -> Programmable Purification Membrane), so
+    this recursion is not depth-limited.
+  - allow_build_reactions: any non-mineral Reaction product encountered is
+    likewise compared build-vs-buy. A Reaction formula's own materials are
+    always a leaf, though -- bought directly, never built further -- since
+    reaction inputs (fuel blocks, moon materials, gas, PI) don't have their
+    own producer in the SDE to begin with.
+A cycle guard prevents infinite recursion in the pathological case of a
+blueprint that (directly or indirectly) requires its own product.
 
 The build-vs-buy decision uses a quick, order-independent price estimate
 (direct market price for every leaf, no region restriction) rather than the
@@ -101,7 +105,14 @@ def _discover(
 ) -> None:
     """Populate `discovered` with every type_id whose price might be needed,
     so they can all be fetched in one batched call before any decisions are
-    made (instead of one live fetch per item during recursion)."""
+    made (instead of one live fetch per item during recursion). Recurses
+    through the full Manufacturing chain to whatever depth it actually goes;
+    a Reaction producer's own materials are always a leaf (see module
+    docstring). `discovered` doubles as the visited set, so a type_id
+    reachable multiple ways (or, pathologically, cyclically) is only walked
+    once."""
+    if type_id in discovered:
+        return
     discovered.add(type_id)
     if type_id in MINERAL_TYPE_IDS:
         return
@@ -111,12 +122,7 @@ def _discover(
     if producer["activity_id"] == MANUFACTURING_ACTIVITY_ID and allow_build_components:
         materials = _blueprint_materials(producer["blueprint_type_id"], db_path)
         for mat_id in materials:
-            discovered.add(mat_id)
-            if mat_id in MINERAL_TYPE_IDS or not allow_build_reactions:
-                continue
-            r_producer = get_producer(mat_id, db_path)
-            if r_producer and r_producer["activity_id"] == REACTION_ACTIVITY_ID:
-                discovered.update(_reaction_materials(r_producer["blueprint_type_id"], db_path).keys())
+            _discover(mat_id, allow_build_components, allow_build_reactions, db_path, discovered)
     elif producer["activity_id"] == REACTION_ACTIVITY_ID and allow_build_reactions:
         discovered.update(_reaction_materials(producer["blueprint_type_id"], db_path).keys())
 
@@ -143,28 +149,34 @@ def expand_requirements(
         info = prices.get(type_id)
         return info["price"] if info else None
 
-    def evaluate_reaction(type_id: int, qty: int):
-        """Returns (build_cost, leaf_requirements, runs, produced_qty) or None."""
-        producer = get_producer(type_id, db_path)
-        if producer is None or producer["activity_id"] != REACTION_ACTIVITY_ID:
-            return None
+    decisions: list[BuildDecision] = []
+
+    def build_from_reaction(type_id: int, qty: int, producer: dict):
+        """Returns (build_cost, leaf_minerals, leaf_other, runs, produced_qty).
+        A reaction formula's own materials are always a leaf -- bought
+        directly, never built further (see module docstring)."""
         materials = _reaction_materials(producer["blueprint_type_id"], db_path)
         output_qty = producer["quantity"]
         runs = math.ceil(qty / output_qty)
         pct = reaction_reduction_percent / 100.0
-        leaf: dict[int, int] = {}
+        leaf_minerals: dict[int, int] = {}
+        leaf_other: dict[int, int] = {}
         cost = 0.0
         for mat_id, base_qty in materials.items():
             need = _me_adjusted_qty(base_qty, runs, pct)
             p = price_of(mat_id)
             if p is None:
                 return None
-            leaf[mat_id] = leaf.get(mat_id, 0) + need
+            target = leaf_minerals if mat_id in MINERAL_TYPE_IDS else leaf_other
+            target[mat_id] = target.get(mat_id, 0) + need
             cost += need * p
-        return cost, leaf, runs, runs * output_qty
+        return cost, leaf_minerals, leaf_other, runs, runs * output_qty
 
-    def evaluate_manufacture(type_id: int, qty: int, producer: dict):
-        """Returns (build_cost, leaf_minerals, leaf_other, runs, produced_qty)."""
+    def build_from_manufacture(type_id: int, qty: int, producer: dict, visiting: frozenset[int]):
+        """Returns (build_cost, leaf_minerals, leaf_other, runs, produced_qty).
+        Non-mineral materials are resolved recursively via `resolve()` --
+        each may itself be built (Manufacturing, to any depth, or Reaction)
+        or bought, whichever is cheaper."""
         materials = _blueprint_materials(producer["blueprint_type_id"], db_path)
         output_qty = producer["quantity"]
         runs = math.ceil(qty / output_qty)
@@ -182,36 +194,67 @@ def expand_requirements(
                 cost += need * p
                 continue
 
-            sub = evaluate_reaction(mat_id, need) if allow_build_reactions else None
-            buy_p = price_of(mat_id)
-            buy_cost = need * buy_p if buy_p is not None else None
-            if sub is not None:
-                sub_build_cost, sub_leaf, sub_runs, sub_produced = sub
-                if buy_cost is not None and buy_cost <= sub_build_cost:
-                    leaf_other[mat_id] = leaf_other.get(mat_id, 0) + need
-                    cost += buy_cost
-                    decisions.append(
-                        BuildDecision(mat_id, names.get(mat_id, str(mat_id)), "buy", sub_build_cost, buy_cost, 0, 0, need)
-                    )
-                else:
-                    for sid, sq in sub_leaf.items():
-                        target = leaf_minerals if sid in MINERAL_TYPE_IDS else leaf_other
-                        target[sid] = target.get(sid, 0) + sq
-                    cost += sub_build_cost
-                    decisions.append(
-                        BuildDecision(
-                            mat_id, names.get(mat_id, str(mat_id)), "build", sub_build_cost, buy_cost, sub_runs, sub_produced, need
-                        )
-                    )
-            else:
-                if buy_cost is None:
-                    return None
-                leaf_other[mat_id] = leaf_other.get(mat_id, 0) + need
-                cost += buy_cost
+            sub = resolve(mat_id, need, visiting)
+            if sub is None:
+                return None
+            sub_cost, sub_minerals, sub_other = sub
+            for sid, sq in sub_minerals.items():
+                leaf_minerals[sid] = leaf_minerals.get(sid, 0) + sq
+            for sid, sq in sub_other.items():
+                leaf_other[sid] = leaf_other.get(sid, 0) + sq
+            cost += sub_cost
         return cost, leaf_minerals, leaf_other, runs, runs * output_qty
 
+    def resolve(type_id: int, qty: int, visiting: frozenset[int] = frozenset()):
+        """Best (cheapest) way to obtain `qty` units of a non-mineral
+        type_id: build it (recursively) if that's possible and cheaper, else
+        buy it outright. Returns (cost, leaf_minerals, leaf_other) -- the
+        flattened set of raw purchases needed, all the way down -- or None
+        if `type_id` can neither be bought (no liquid market price anywhere)
+        nor built (same problem, recursively, for something it needs).
+        Appends a BuildDecision whenever there was an actual build option to
+        weigh against buying, so the "why" is visible even when buy wins or
+        the whole thing turns out infeasible."""
+        if type_id in visiting:
+            return None  # cycle guard against a pathological self-referencing BOM
+
+        producer = get_producer(type_id, db_path)
+        build = None
+        if producer is not None:
+            if producer["activity_id"] == MANUFACTURING_ACTIVITY_ID and allow_build_components:
+                build = build_from_manufacture(type_id, qty, producer, visiting | {type_id})
+            elif producer["activity_id"] == REACTION_ACTIVITY_ID and allow_build_reactions:
+                build = build_from_reaction(type_id, qty, producer)
+
+        buy_p = price_of(type_id)
+        buy_cost = qty * buy_p if buy_p is not None else None
+
+        if build is not None:
+            build_cost, leaf_minerals, leaf_other, runs, produced = build
+            if buy_cost is not None and buy_cost <= build_cost:
+                decisions.append(
+                    BuildDecision(type_id, names.get(type_id, str(type_id)), "buy", build_cost, buy_cost, 0, 0, qty)
+                )
+                return buy_cost, {}, {type_id: qty}
+            decisions.append(
+                BuildDecision(type_id, names.get(type_id, str(type_id)), "build", build_cost, buy_cost, runs, produced, qty)
+            )
+            return build_cost, leaf_minerals, leaf_other
+
+        if buy_cost is not None:
+            return buy_cost, {}, {type_id: qty}
+
+        # Neither buildable (no producer, or building it hit this same dead
+        # end further down) nor buyable (no liquid market price anywhere).
+        # Surfaced explicitly rather than just vanishing from the decisions
+        # list, since a silent failure here is indistinguishable from "never
+        # tried" -- e.g. some newer capital-ship materials are reward-only
+        # Commodities items with no blueprint in the SDE at all, so there's
+        # nothing to build from and nobody selling one either.
+        decisions.append(BuildDecision(type_id, names.get(type_id, str(type_id)), "unavailable", None, None, 0, 0, qty))
+        return None
+
     expanded: dict[int, int] = {}
-    decisions: list[BuildDecision] = []
 
     def add(type_id: int, qty: int) -> None:
         expanded[type_id] = expanded.get(type_id, 0) + qty
@@ -221,40 +264,14 @@ def expand_requirements(
             add(type_id, qty)
             continue
 
-        producer = get_producer(type_id, db_path)
-        buy_p = price_of(type_id)
-        buy_cost = qty * buy_p if buy_p is not None else None
-
-        build_result = None
-        if producer is not None:
-            if producer["activity_id"] == MANUFACTURING_ACTIVITY_ID and allow_build_components:
-                build_result = evaluate_manufacture(type_id, qty, producer)
-                if build_result is not None:
-                    build_cost, leaf_minerals, leaf_other, runs, produced = build_result
-            elif producer["activity_id"] == REACTION_ACTIVITY_ID and allow_build_reactions:
-                sub = evaluate_reaction(type_id, qty)
-                if sub is not None:
-                    build_cost, leaf, runs, produced = sub
-                    leaf_minerals = {mid: q for mid, q in leaf.items() if mid in MINERAL_TYPE_IDS}
-                    leaf_other = {mid: q for mid, q in leaf.items() if mid not in MINERAL_TYPE_IDS}
-                    build_result = (build_cost, leaf_minerals, leaf_other, runs, produced)
-
-        if build_result is not None:
-            build_cost, leaf_minerals, leaf_other, runs, produced = build_result
-            if buy_cost is not None and buy_cost <= build_cost:
-                add(type_id, qty)
-                decisions.append(
-                    BuildDecision(type_id, names.get(type_id, str(type_id)), "buy", build_cost, buy_cost, 0, 0, qty)
-                )
-            else:
-                for mid, mq in leaf_minerals.items():
-                    add(mid, mq)
-                for oid, oq in leaf_other.items():
-                    add(oid, oq)
-                decisions.append(
-                    BuildDecision(type_id, names.get(type_id, str(type_id)), "build", build_cost, buy_cost, runs, produced, qty)
-                )
-        else:
+        result = resolve(type_id, qty)
+        if result is None:
             add(type_id, qty)
+            continue
+        _, leaf_minerals, leaf_other = result
+        for mid, mq in leaf_minerals.items():
+            add(mid, mq)
+        for oid, oq in leaf_other.items():
+            add(oid, oq)
 
     return ExpansionResult(expanded_required=expanded, build_decisions=decisions)

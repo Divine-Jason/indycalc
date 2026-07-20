@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -71,12 +72,29 @@ HUB_STATION_IDS: dict[str, int] = {
 HUB_REGION_NAMES = list(dict.fromkeys(TRADE_HUBS.values()))
 
 _CHUNK_SIZE = 200  # generous headroom well under any practical URL length limit
+_FETCH_MAX_WORKERS = 8  # plain network I/O (requests.get releases the GIL) -- same
+# safety reasoning as order_book.py's ThreadPoolExecutor use, not the scipy/HiGHS
+# native-threading danger documented in optimizer.py
 
 # A single troll/leftover sell order (e.g. 14 units listed at a fraction of a
 # fair price) can otherwise look like the "cheapest" source and blow up the
 # optimizer's plan. Require a minimum listed quantity and order count before
 # trusting a (region, type) price as a real bulk source.
+#
+# MIN_LIQUIDITY_VOLUME only makes sense for ore/the 8 refined minerals, which
+# genuinely trade in huge lots (hundreds of thousands of units) -- a troll
+# order there really is distinguishable by low volume. It does NOT make sense
+# for components/PI/reaction materials: a capital ship component worth
+# hundreds of millions of ISK will never have 1000 units listed, full stop --
+# confirmed live, a Jita component with 26 real sell orders and 126 total
+# units (777M ISK each) was being silently rejected by this exact threshold,
+# not because the market wasn't real, but because "real" for an expensive
+# item just looks different than "real" for ore. COMPONENT_MIN_LIQUIDITY_VOLUME
+# is the equivalent floor for everything that isn't ore/minerals -- order
+# count (>=2, applies to both) is what actually guards against a single troll
+# order regardless of the item's price tier.
 MIN_LIQUIDITY_VOLUME = 1000
+COMPONENT_MIN_LIQUIDITY_VOLUME = 1
 MIN_LIQUIDITY_ORDER_COUNT = 2
 
 
@@ -118,6 +136,13 @@ def _all_ore_type_ids(conn: sqlite3.Connection) -> list[int]:
     return [r[0] for r in rows]
 
 
+def _bulk_liquidity_type_ids(conn: sqlite3.Connection) -> set[int]:
+    """Ore + the 8 refined minerals -- the only things MIN_LIQUIDITY_VOLUME's
+    higher bar applies to (see its comment). Everything else uses
+    COMPONENT_MIN_LIQUIDITY_VOLUME instead."""
+    return set(_all_ore_type_ids(conn)) | set(MINERAL_TYPE_IDS)
+
+
 def _chunked(items: list[int], size: int) -> list[list[int]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
@@ -146,18 +171,31 @@ def _fetch_and_store(
     conn: sqlite3.Connection, type_ids: list[int], region_ids: dict[int, str]
 ) -> int:
     """Fetch aggregates for `type_ids` across `region_ids` and upsert into
-    market_prices. One Fuzzworks call per (region, chunk-of-200-types)."""
+    market_prices. One Fuzzworks call per (region, chunk-of-200-types),
+    fetched concurrently -- a cold cache can mean several regions x several
+    chunks all at once (e.g. the first time a capital ship/structure's full,
+    several-levels-deep component tree gets discovered), and these are
+    independent HTTP calls with no shared state to race on. Only the HTTP
+    fetch happens off the calling thread; every sqlite3 write stays on it
+    (connections aren't thread-safe to share) -- same division of labor as
+    order_book.py's concurrent ESI fetches."""
     fetched_at = time.time()
     written = 0
-    for region_id in region_ids:
-        for chunk in _chunked(type_ids, _CHUNK_SIZE):
-            resp = requests.get(
-                AGGREGATES_URL,
-                params={"region": region_id, "types": ",".join(map(str, chunk))},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            rows = _parse_aggregates_rows(region_id, chunk, resp.json(), fetched_at)
+    jobs = [(region_id, chunk) for region_id in region_ids for chunk in _chunked(type_ids, _CHUNK_SIZE)]
+
+    def fetch_one(job: tuple[int, list[int]]):
+        region_id, chunk = job
+        resp = requests.get(
+            AGGREGATES_URL,
+            params={"region": region_id, "types": ",".join(map(str, chunk))},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return region_id, chunk, resp.json()
+
+    with ThreadPoolExecutor(max_workers=min(_FETCH_MAX_WORKERS, len(jobs) or 1)) as pool:
+        for region_id, chunk, data in pool.map(fetch_one, jobs):
+            rows = _parse_aggregates_rows(region_id, chunk, data, fetched_at)
             conn.executemany(
                 """
                 INSERT INTO market_prices
@@ -175,11 +213,10 @@ def _fetch_and_store(
                 rows,
             )
             written += len(rows)
-            # Commit after each region/chunk rather than once at the end -- this
-            # loop makes a live network call per iteration, and holding a write
-            # transaction open across many seconds of network I/O is exactly
-            # what causes "database is locked" against a concurrent reader/writer
-            # (e.g. another Streamlit session rerun).
+            # Commit after each result rather than once at the end -- holding a
+            # write transaction open across many seconds of network I/O is
+            # exactly what causes "database is locked" against a concurrent
+            # reader/writer (e.g. another Streamlit session rerun).
             conn.commit()
     return written
 
@@ -254,19 +291,22 @@ def best_station_prices(type_ids: list[int], station_id: int, db_path: Path = DB
     conn = db.connect(db_path)
     try:
         _ensure_station_table(conn)
+        bulk_ids = _bulk_liquidity_type_ids(conn)
         placeholders = ",".join("?" for _ in type_ids)
         rows = conn.execute(
             f"""
-            SELECT type_id, sell_min, sell_percentile
+            SELECT type_id, sell_min, sell_percentile, sell_volume
             FROM station_prices
             WHERE station_id = ? AND type_id IN ({placeholders})
-              AND sell_volume >= {MIN_LIQUIDITY_VOLUME}
               AND sell_order_count >= {MIN_LIQUIDITY_ORDER_COUNT}
             """,
             [station_id] + list(type_ids),
         ).fetchall()
         best: dict[int, dict] = {}
-        for type_id, sell_min, sell_percentile in rows:
+        for type_id, sell_min, sell_percentile, sell_volume in rows:
+            min_volume = MIN_LIQUIDITY_VOLUME if type_id in bulk_ids else COMPONENT_MIN_LIQUIDITY_VOLUME
+            if (sell_volume or 0) < min_volume:
+                continue
             price = sell_percentile if sell_percentile is not None else sell_min
             if price is not None:
                 best[type_id] = {"price": price}
@@ -338,20 +378,23 @@ def best_multi_station_prices(
     conn = db.connect(db_path)
     try:
         _ensure_station_table(conn)
+        bulk_ids = _bulk_liquidity_type_ids(conn)
         type_placeholders = ",".join("?" for _ in type_ids)
         station_placeholders = ",".join("?" for _ in station_ids)
         rows = conn.execute(
             f"""
-            SELECT type_id, station_id, sell_min, sell_percentile
+            SELECT type_id, station_id, sell_min, sell_percentile, sell_volume
             FROM station_prices
             WHERE station_id IN ({station_placeholders}) AND type_id IN ({type_placeholders})
-              AND sell_volume >= {MIN_LIQUIDITY_VOLUME}
               AND sell_order_count >= {MIN_LIQUIDITY_ORDER_COUNT}
             """,
             list(station_ids) + list(type_ids),
         ).fetchall()
         best: dict[int, dict] = {}
-        for type_id, station_id, sell_min, sell_percentile in rows:
+        for type_id, station_id, sell_min, sell_percentile, sell_volume in rows:
+            min_volume = MIN_LIQUIDITY_VOLUME if type_id in bulk_ids else COMPONENT_MIN_LIQUIDITY_VOLUME
+            if (sell_volume or 0) < min_volume:
+                continue
             price = sell_percentile if sell_percentile is not None else sell_min
             if price is None:
                 continue
@@ -491,9 +534,12 @@ def best_prices(
     {type_id: {"price": float, "region_name": str}}.
     Uses sell_percentile (robust against a single troll low-ball order) and
     falls back to sell_min if percentile is missing. Rows with too little
-    listed volume/order count (MIN_LIQUIDITY_VOLUME / _ORDER_COUNT) are
-    skipped -- a single leftover order for a handful of units otherwise looks
-    like a great "price" and derails the whole plan.
+    listed volume/order count are skipped -- a single leftover order for a
+    handful of units otherwise looks like a great "price" and derails the
+    whole plan. The volume bar is much lower for anything that isn't ore/the
+    8 refined minerals (see COMPONENT_MIN_LIQUIDITY_VOLUME's comment) --
+    order count (>=2) is what actually screens out a single troll order
+    regardless of the item's price tier.
 
     Pass `region_names` (e.g. a single trade hub's region) to restrict the
     search to those regions only, instead of scattering across all 5 hub
@@ -502,6 +548,7 @@ def best_prices(
     conn = db.connect(db_path)
     try:
         _ensure_table(conn)
+        bulk_ids = _bulk_liquidity_type_ids(conn)
         placeholders = ",".join("?" for _ in type_ids)
         params: list = list(type_ids)
         region_filter = ""
@@ -511,11 +558,10 @@ def best_prices(
             params += list(region_names)
         rows = conn.execute(
             f"""
-            SELECT mp.type_id, mp.sell_min, mp.sell_percentile, r.region_name
+            SELECT mp.type_id, mp.sell_min, mp.sell_percentile, r.region_name, mp.sell_volume
             FROM market_prices mp
             JOIN regions r ON r.region_id = mp.region_id
             WHERE mp.type_id IN ({placeholders})
-              AND mp.sell_volume >= {MIN_LIQUIDITY_VOLUME}
               AND mp.sell_order_count >= {MIN_LIQUIDITY_ORDER_COUNT}
             {region_filter}
             """,
@@ -523,7 +569,10 @@ def best_prices(
         ).fetchall()
 
         best: dict[int, dict] = {}
-        for type_id, sell_min, sell_percentile, region_name in rows:
+        for type_id, sell_min, sell_percentile, region_name, sell_volume in rows:
+            min_volume = MIN_LIQUIDITY_VOLUME if type_id in bulk_ids else COMPONENT_MIN_LIQUIDITY_VOLUME
+            if (sell_volume or 0) < min_volume:
+                continue
             price = sell_percentile if sell_percentile is not None else sell_min
             if price is None:
                 continue
