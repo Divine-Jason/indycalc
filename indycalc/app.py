@@ -13,6 +13,34 @@ from indycalc import blueprint_calc, job_cost, optimizer, price_cache, productio
 from indycalc.ore_tiers import DEFAULT_REFINE_PCT, TIERS
 from indycalc.sde_loader import DB_PATH
 
+NO_STRUCTURE_LABEL = "NPC station / unrigged"
+
+# Base (unrigged) Engineering Complex bonuses: {label: (material %, time %, job
+# ISK cost %)}. Verified against CCP's own "Building Dreams: Introducing
+# Engineering Complexes" dev blog and EVE University's wiki (2026-07) -- these
+# are highsec-applicable base structure bonuses only (the 1% material bonus is
+# flat everywhere; no security-status multiplier applies to it, unlike rigs).
+# All three sizes give the same 1% material bonus -- what actually scales with
+# structure size is job time and job ISK cost.
+STRUCTURE_BONUSES: dict[str, tuple[float, float, float]] = {
+    NO_STRUCTURE_LABEL: (0.0, 0.0, 0.0),
+    "Raitaru (Medium Engineering Complex)": (1.0, 15.0, 3.0),
+    "Azbel (Large Engineering Complex)": (1.0, 20.0, 4.0),
+    "Sotiyo (XL Engineering Complex)": (1.0, 30.0, 5.0),
+}
+
+
+def _stack_pct(*percents: float) -> float:
+    """Combine independent EVE efficiency bonuses (blueprint ME/TE research,
+    structure bonus) the way EVE itself does: multiplicatively --
+    base * (1 - a/100) * (1 - b/100) -- not by adding the raw percentages
+    together. Returns the single combined percentage."""
+    factor = 1.0
+    for p in percents:
+        factor *= 1 - p / 100.0
+    return (1 - factor) * 100.0
+
+
 # Streamlit reruns this whole script on every widget interaction. Without
 # caching, every rerun redoes the full MILP-based optimize() call for every
 # entry in the buying-location comparison table (region + station for each
@@ -290,6 +318,24 @@ with st.sidebar:
     )
     allow_direct_minerals = not no_direct
 
+    st.header("Build structure")
+    build_structure = st.selectbox(
+        "Engineering Complex",
+        options=list(STRUCTURE_BONUSES),
+        help=(
+            "Base structure bonuses, from CCP's own dev blog and EVE University's wiki "
+            "-- material use, job time, and job ISK cost, stacked multiplicatively (not "
+            "added) with your blueprint's own ME%/TE% research, the same way EVE itself "
+            "combines them. Applies to the top-level blueprint and to any components you "
+            "choose to craft yourself (both are Manufacturing jobs) -- reactions happen "
+            "in a different structure type (a Refinery) and aren't affected. Rig bonuses "
+            "aren't modeled -- they only affect job time (not material cost), and there's "
+            "a separate rig for every ship size, T1 vs T2 ship, and rig tier, too many "
+            "combinations to be worth the UI complexity here."
+        ),
+    )
+    structure_me_pct, structure_te_pct, structure_job_cost_pct = STRUCTURE_BONUSES[build_structure]
+
     st.header("Production")
     allow_build_components = st.toggle(
         "Craft components myself",
@@ -349,6 +395,7 @@ with st.sidebar:
     build_system_id = None
     build_system_name = None
     facility_tax_pct = 0.0
+    cost_index_override = None
     manufacturing_slots = 1
     reaction_slots = 1
     time_efficiency_pct = 0.0
@@ -369,6 +416,27 @@ with st.sidebar:
             build_system_id, build_system_name, _build_system_security = system_matches[build_system_selected]
         else:
             st.warning("No system matches that search.")
+
+        cost_index_override = None
+        use_custom_cost_index = st.toggle(
+            "Manually set system cost index",
+            value=False,
+            help=(
+                "ESI's /industry/systems/ doesn't publish a cost index for wormhole "
+                "(J-space) systems, so the automatic lookup always comes back empty "
+                "there -- turn this on to supply one yourself (check the structure's "
+                "own Industry window) and still get a job cost estimate. Also useful "
+                "for any other system whose index just isn't cached yet. Applied to "
+                "manufacturing, reaction, and copying cost alike."
+            ),
+        )
+        if use_custom_cost_index:
+            cost_index_override_pct = st.number_input(
+                "System cost index %",
+                min_value=0.0, max_value=100.0, value=0.0, step=0.1,
+                help="EVE shows this as a percentage in the structure's Industry window (e.g. a \"2.50%\" Manufacturing Cost Index).",
+            )
+            cost_index_override = cost_index_override_pct / 100.0
 
         facility_tax_pct = st.number_input(
             "Facility tax %", min_value=0.0, max_value=100.0, value=0.0, step=0.1,
@@ -440,6 +508,24 @@ with st.sidebar:
                 key=f"refine_{tier}",
             )
 
+# Fold the Engineering Complex's structure bonus into the plain ME%/TE%
+# values from here on, rather than threading structure_me_pct etc. through
+# every downstream call -- everything below already accepts a single
+# "effective" ME%/TE%, so this is the one place that needs to know these are
+# now composed of more than just blueprint research. Reactions and job
+# installation fee's tax term are untouched (see STRUCTURE_BONUSES/
+# manufacturing_job_cost's docstrings for why). me_percent/component_me_percent
+# feed the (Recalculate-gated) purchase-plan MILP below, so they're folded in
+# here, before that gate. time_efficiency_pct/job_cost_reduction_pct feed the
+# job-cost section further down, which -- like facility_tax_pct next to it --
+# was never part of that gate (cheap to recompute, no MILP involved), so they
+# stay live rather than getting added to live_settings/committed.
+me_percent = _stack_pct(me_percent, structure_me_pct)
+if allow_build_components:
+    component_me_percent = _stack_pct(component_me_percent, structure_me_pct)
+time_efficiency_pct = _stack_pct(time_efficiency_pct, structure_te_pct)
+job_cost_reduction_pct = structure_job_cost_pct
+
 # Everything below this point is the expensive part (the buy-side MILP,
 # potentially 11+ solves for the comparison table). Sidebar widgets above
 # still update instantly (conditional sections appearing/disappearing etc.)
@@ -500,7 +586,13 @@ use_station_combo = committed["use_station_combo"]
 max_stations_combo = committed["max_stations_combo"]
 refine_pct = committed["refine_pct"]
 
-st.subheader(f"{bp_name} — ME {me_percent}% — {runs} run(s)")
+st.subheader(f"{bp_name} — ME {me_percent:.2f}% — {runs} run(s)")
+if build_structure != NO_STRUCTURE_LABEL:
+    st.caption(
+        f"ME% above already includes your {build_structure.split(' (')[0]} base bonus "
+        f"({structure_me_pct:.0f}%), stacked multiplicatively with your blueprint's own "
+        "ME% research, not added."
+    )
 
 required = blueprint_calc.required_materials(bp_type_id, me_percent, runs)
 if not required:
@@ -756,7 +848,9 @@ if include_job_cost and build_system_id is not None:
     job_rows = []
     missing_job_data = []
 
-    top_cost = job_cost.manufacturing_job_cost(bp_type_id, runs, build_system_id, facility_tax_pct)
+    top_cost = job_cost.manufacturing_job_cost(
+        bp_type_id, runs, build_system_id, facility_tax_pct, job_cost_reduction_pct, cost_index_override
+    )
     if top_cost is None:
         missing_job_data.append(bp_name)
     else:
@@ -770,10 +864,14 @@ if include_job_cost and build_system_id is not None:
             missing_job_data.append(d.name)
             continue
         if producer["activity_id"] == 1:
-            cost = job_cost.manufacturing_job_cost(producer["blueprint_type_id"], d.runs, build_system_id, facility_tax_pct)
+            cost = job_cost.manufacturing_job_cost(
+                producer["blueprint_type_id"], d.runs, build_system_id, facility_tax_pct, job_cost_reduction_pct, cost_index_override
+            )
             activity = "manufacturing"
         else:
-            cost = job_cost.reaction_job_cost(producer["blueprint_type_id"], d.runs, build_system_id, facility_tax_pct)
+            cost = job_cost.reaction_job_cost(
+                producer["blueprint_type_id"], d.runs, build_system_id, facility_tax_pct, cost_index_override
+            )
             activity = "reaction"
         if cost is None:
             missing_job_data.append(d.name)
@@ -838,7 +936,9 @@ if include_job_cost and build_system_id is not None:
             "copying is less well established. Treat as directional."
         )
         copy_rows = []
-        top_copy = job_cost.copy_job_cost(bp_type_id, runs, build_system_id, facility_tax_pct)
+        top_copy = job_cost.copy_job_cost(
+            bp_type_id, runs, build_system_id, facility_tax_pct, job_cost_reduction_pct, cost_index_override
+        )
         if top_copy is not None:
             copy_rows.append({"Item": bp_name, "Runs": runs, "Copy Cost (ISK)": round(top_copy, 2)})
         for d in result.build_decisions:
@@ -847,7 +947,9 @@ if include_job_cost and build_system_id is not None:
             producer = production_chain.get_producer(d.type_id)
             if producer is None or producer["activity_id"] != 1:
                 continue  # reactions can't be copied
-            c = job_cost.copy_job_cost(producer["blueprint_type_id"], d.runs, build_system_id, facility_tax_pct)
+            c = job_cost.copy_job_cost(
+                producer["blueprint_type_id"], d.runs, build_system_id, facility_tax_pct, job_cost_reduction_pct, cost_index_override
+            )
             if c is not None:
                 copy_rows.append({"Item": d.name, "Runs": d.runs, "Copy Cost (ISK)": round(c, 2)})
         if copy_rows:

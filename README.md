@@ -205,6 +205,41 @@ The build-vs-buy comparison itself uses a quick, region-independent price estima
 (not the same batch-optimized ore MILP used for the final purchase plan) -- see the
 simplification note below.
 
+## Building in an Engineering Complex
+
+The "Build structure" sidebar section applies an Upwell Engineering Complex's own base
+manufacturing bonuses on top of your blueprint's ME%/TE% research -- material use, job
+time, and job ISK cost. Numbers are verified against CCP's own "Building Dreams:
+Introducing Engineering Complexes" dev blog and EVE University's wiki (checked
+2026-07), highsec only (matching the rest of this tool's scope):
+
+| Structure | Material | Time | Job ISK cost |
+|---|---|---|---|
+| Raitaru (Medium) | -1% | -15% | -3% |
+| Azbel (Large) | -1% | -20% | -4% |
+| Sotiyo (XL) | -1% | -30% | -5% |
+
+All three sizes give the same 1% material bonus -- what actually scales with structure
+size is job time and job ISK cost.
+
+**Rig bonuses aren't modeled.** They only affect job time (not material cost), and
+there's a separate rig for every ship size, T1 vs T2 ship, and rig tier -- too many
+combinations to be worth the UI complexity here. Only the base (unrigged) structure
+bonus is applied.
+
+**Stacking is multiplicative, not additive** -- matching EVE's own formula
+(`base * (1 - ME%) * (1 - structure%)`, applied once per independent bonus source). A
+10% researched BPO plus Azbel's 1% comes out to 10.9% effective ME, not 11%. The
+displayed "ME %" in the results header is always this combined effective number; a
+caption underneath breaks down what it's made of whenever a structure is selected.
+
+Scope: applies to the top-level blueprint and to any components you choose to craft
+yourself (`Craft components myself` -- both are Manufacturing jobs), and to the job
+installation fee/copying cost when "Include job installation cost" is on. Does **not**
+apply to reaction materials -- reactions run in a different structure type (a Refinery,
+e.g. Athanor/Tatara) with its own separate bonuses, which is what the existing
+"Reaction material reduction %" field already represents.
+
 ## Buying from a single station
 
 Region-level pricing ("Buy from" a hub) can still mean hauling between several
@@ -254,7 +289,15 @@ run the job in, since there's no reason your buy and build locations have to mat
   fetched from ESI too (`/industry/systems/`) -- some systems (Jita notably) have a
   much higher manufacturing index than others precisely because they're so busy.
   Facility tax is set by whoever owns the station/structure and can't be looked up
-  generically, so it's a number you enter.
+  generically, so it's a number you enter. If an Engineering Complex is selected under
+  "Build structure," its ISK-cost bonus (Raitaru 3% / Azbel 4% / Sotiyo 5%) is applied
+  as a further discount on top of this -- see "Building in an Engineering Complex" above.
+- **Manually set system cost index**: ESI's `/industry/systems/` endpoint doesn't
+  publish a cost index for wormhole (J-space) systems, so the automatic lookup always
+  comes back empty there and the job cost section would otherwise just show nothing for
+  it. Toggle this on to type in a cost index yourself (check the structure's own
+  Industry window) -- applies to manufacturing, reaction, and copying cost alike. Also
+  useful as a fallback for any other system whose index isn't cached for some reason.
 - **BPC copying cost**: if you'd rather run the job off a disposable copy than tie up
   a researched BPO, this estimates that copy's cost, scaled by however many runs it
   needs. **Lower confidence than the job fee above** -- the documented formula for
@@ -271,7 +314,9 @@ run the job in, since there's no reason your buy and build locations have to mat
   conservatively assumes the whole reaction phase finishes before manufacturing
   starts -- this can overestimate total time, never underestimate it). Time Efficiency
   % applies to manufacturing jobs only; reactions have no TE research, only an
-  unmodeled refinery duration rig bonus.
+  unmodeled refinery duration rig bonus. An Engineering Complex's own time bonus stacks
+  into this the same multiplicative way as the material bonus -- see "Building in an
+  Engineering Complex" above.
 
 ## Performance: caching and the Recalculate button
 

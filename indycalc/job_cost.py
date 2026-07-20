@@ -25,6 +25,18 @@ copying formula is less so -- even players debate the exact number publicly
 Facility tax is set by whoever owns the station/structure the job runs in;
 there's no way to look that up generically, so it's a number the caller
 supplies (a UI input), not fetched here.
+
+Engineering Complex bonuses (Raitaru/Azbel/Sotiyo -- material use, job time,
+job ISK cost) are applied by the caller (app.py), not this module, except for
+the ISK-cost bonus's `job_cost_reduction_pct` param on manufacturing_job_cost
+and copy_job_cost -- that one can't be pre-folded into an equivalent
+percentage the way material/time bonuses can, since it's a separate
+multiplicative term on the finished fee rather than something that composes
+with facility_tax_pct inside the (cost_index + tax + surcharge) sum above.
+See app.py's combined-bonus math and README's "Building in an Engineering
+Complex" section for the actual bonus figures (CCP's own dev blog / EVE
+University wiki, verified 2026-07) and how they stack with blueprint ME/TE
+research.
 """
 from __future__ import annotations
 
@@ -301,31 +313,59 @@ def _eiv_per_run(blueprint_type_id: int, materials_table: str, id_column: str, c
 
 
 def manufacturing_job_cost(
-    blueprint_type_id: int, runs: int, system_id: int, facility_tax_pct: float, db_path: Path = DB_PATH
+    blueprint_type_id: int,
+    runs: int,
+    system_id: int,
+    facility_tax_pct: float,
+    job_cost_reduction_pct: float = 0.0,
+    cost_index_override: float | None = None,
+    db_path: Path = DB_PATH,
 ) -> float | None:
     """Job installation fee to manufacture `runs` runs of this blueprint at
     `system_id`, or None if the needed adjusted-price/cost-index data isn't
-    cached yet (call refresh_industry_data() first)."""
+    cached yet (call refresh_industry_data() first).
+
+    `job_cost_reduction_pct` is an Engineering Complex's base ISK-cost bonus
+    (Raitaru 3% / Azbel 4% / Sotiyo 5%, per CCP's own numbers) -- a flat
+    percentage taken off the computed fee, not part of the cost_index +
+    facility_tax + SCC_surcharge sum above (it's a separate multiplicative
+    term CCP documents as "reduction in manufacturing and science job
+    required ISK cost").
+
+    `cost_index_override` (a fraction, e.g. 0.025 for 2.5%, not a percent)
+    replaces the ESI-sourced lookup entirely when given -- ESI's
+    /industry/systems/ doesn't publish a cost index for wormhole (J-space)
+    systems, so the automatic lookup always misses there; this is the escape
+    hatch for that (or for any other system whose index isn't cached)."""
     conn = db.connect(db_path)
     try:
         _ensure_tables(conn)
         eiv = _eiv_per_run(blueprint_type_id, "blueprint_materials", "blueprint_type_id", conn)
-        cost_index = _cost_index(system_id, "manufacturing", conn)
+        cost_index = cost_index_override if cost_index_override is not None else _cost_index(system_id, "manufacturing", conn)
         if eiv is None or cost_index is None:
             return None
-        return eiv * runs * (cost_index + facility_tax_pct / 100.0 + SCC_SURCHARGE_PCT / 100.0)
+        fee = eiv * runs * (cost_index + facility_tax_pct / 100.0 + SCC_SURCHARGE_PCT / 100.0)
+        return fee * (1 - job_cost_reduction_pct / 100.0)
     finally:
         conn.close()
 
 
 def reaction_job_cost(
-    formula_type_id: int, runs: int, system_id: int, facility_tax_pct: float, db_path: Path = DB_PATH
+    formula_type_id: int,
+    runs: int,
+    system_id: int,
+    facility_tax_pct: float,
+    cost_index_override: float | None = None,
+    db_path: Path = DB_PATH,
 ) -> float | None:
+    """See manufacturing_job_cost() for `cost_index_override` (same J-space
+    use case; reaction has no job_cost_reduction_pct since that Engineering
+    Complex bonus doesn't apply to Refineries, where reactions actually run)."""
     conn = db.connect(db_path)
     try:
         _ensure_tables(conn)
         eiv = _eiv_per_run(formula_type_id, "reaction_materials", "formula_type_id", conn)
-        cost_index = _cost_index(system_id, "reaction", conn)
+        cost_index = cost_index_override if cost_index_override is not None else _cost_index(system_id, "reaction", conn)
         if eiv is None or cost_index is None:
             return None
         return eiv * runs * (cost_index + facility_tax_pct / 100.0 + SCC_SURCHARGE_PCT / 100.0)
@@ -334,20 +374,31 @@ def reaction_job_cost(
 
 
 def copy_job_cost(
-    blueprint_type_id: int, runs: int, system_id: int, facility_tax_pct: float, db_path: Path = DB_PATH
+    blueprint_type_id: int,
+    runs: int,
+    system_id: int,
+    facility_tax_pct: float,
+    job_cost_reduction_pct: float = 0.0,
+    cost_index_override: float | None = None,
+    db_path: Path = DB_PATH,
 ) -> float | None:
     """Cost to make a single BPC with `runs` runs of this (Manufacturing)
     blueprint. Lower confidence than manufacturing_job_cost -- see module
     docstring. facility_tax_pct is accepted for a consistent call signature
-    but the documented formula for copying doesn't include a tax term."""
+    but the documented formula for copying doesn't include a tax term.
+    `job_cost_reduction_pct` is the same Engineering Complex bonus as
+    manufacturing_job_cost() -- copying is a "science job" under CCP's own
+    wording for that bonus, same as manufacturing. `cost_index_override`:
+    see manufacturing_job_cost() (same J-space use case)."""
     conn = db.connect(db_path)
     try:
         _ensure_tables(conn)
         eiv = _eiv_per_run(blueprint_type_id, "blueprint_materials", "blueprint_type_id", conn)
-        cost_index = _cost_index(system_id, "copying", conn)
+        cost_index = cost_index_override if cost_index_override is not None else _cost_index(system_id, "copying", conn)
         if eiv is None or cost_index is None:
             return None
-        return cost_index * runs * COPY_COST_FACTOR * eiv
+        cost = cost_index * runs * COPY_COST_FACTOR * eiv
+        return cost * (1 - job_cost_reduction_pct / 100.0)
     finally:
         conn.close()
 
