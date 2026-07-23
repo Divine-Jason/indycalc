@@ -49,12 +49,12 @@ def _stack_pct(*percents: float) -> float:
 # at all). st.cache_data memoizes by argument hash across reruns; cleared
 # explicitly whenever cached market/industry data is refreshed so results
 # can't go stale silently.
-cached_expand = st.cache_data(show_spinner=False)(production_chain.expand_requirements)
-cached_optimize = st.cache_data(show_spinner=False)(optimizer.optimize)
-cached_best_station_combo = st.cache_data(show_spinner=False)(optimizer.best_station_combo)
+cached_expand = st.cache_data(show_spinner=False, max_entries=50)(production_chain.expand_requirements)
+cached_optimize = st.cache_data(show_spinner=False, max_entries=50)(optimizer.optimize)
+cached_best_station_combo = st.cache_data(show_spinner=False, max_entries=50)(optimizer.best_station_combo)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=50)
 def cached_comparison_table(
     required, refine_pct, ore_mode, allow_direct_minerals,
     allow_build_components, allow_build_reactions,

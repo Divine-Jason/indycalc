@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -46,6 +47,16 @@ from indycalc.production_chain import BuildDecision
 from indycalc.sde_loader import DB_PATH
 
 REPROCESS_BATCH_FALLBACK = 100
+
+# Streamlit reruns each session in its own thread, and nothing stops two
+# overlapping runs (e.g. clicking Recalculate again before a prior solve
+# finishes) from both reaching _solve_ore_milp at once. scipy's milp() drops
+# into HiGHS's native C++ solver, which isn't safe to enter concurrently from
+# multiple threads in the same process -- observed in practice as intermittent
+# access-violation crashes of the whole server (no Python traceback, since the
+# crash is below the interpreter). Serializing native solver entry avoids that
+# without touching the UI at all -- a second caller just waits its turn.
+_MILP_LOCK = threading.Lock()
 
 # "any": let the LP pick whichever is cheapest, raw or compressed.
 # "compressed": only consider compressed ore -- ~100x less volume per unit of
@@ -367,7 +378,8 @@ def _solve_ore_milp(candidates: list[tuple], mineral_ids: list[int], mineral_req
     required_vec = [mineral_required[mid] for mid in mineral_ids]
     ub_vec = [cand[7] for cand in candidates]
     constraints = LinearConstraint(yield_per_batch, lb=required_vec, ub=math.inf)
-    return milp(c=cost_per_batch, constraints=constraints, integrality=[1] * n, bounds=Bounds(lb=0, ub=ub_vec))
+    with _MILP_LOCK:
+        return milp(c=cost_per_batch, constraints=constraints, integrality=[1] * n, bounds=Bounds(lb=0, ub=ub_vec))
 
 
 def _optimize_ore(
