@@ -1,3 +1,6 @@
+# Claude Code's own tooling state -- not part of the app
+.claude/
+
 # Local data cache -- rebuilt by indycalc/sde_loader.py and indycalc/price_cache.py
 indycalc/data/
 
