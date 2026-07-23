@@ -81,6 +81,7 @@ no separate stop script to hunt down.
 | `indycalc/order_book.py` | Fetches the *real* sell-order book from ESI (not a blended average) for whichever candidates `optimizer.py` decides are worth checking, so the optimizer knows exactly how much is available at each price -- see "Depth-aware pricing" below. |
 | `indycalc/optimizer.py` | The actual optimization: a mixed-integer program that picks the cheapest combination of ore batches (and/or direct mineral purchases) to cover required minerals, plus market pricing for non-ore components -- from a region, a single station, or unrestricted. Every candidate is priced in real, depth-capped tiers from `order_book.py`, fetched lazily in cheapest-surface-price-first order -- see "Depth-aware pricing" below. |
 | `indycalc/production_chain.py` | Build-vs-buy: expands components/reaction materials into their own sub-materials when that's cheaper than buying them outright. See "Building your own components/reactions" below. |
+| `indycalc/inventory.py` | Parses a pasted inventory (ore/minerals/components/PI) and credits it against the blueprint's required materials before any buy/build pricing runs. See "Using materials you already have (inventory)" below. |
 | `indycalc/job_cost.py` | Job installation fee, BPC copying cost, and build-time estimates -- pulls adjusted prices and system cost indices from ESI. See "Job installation cost, BPC copying, and build time" below. |
 | `indycalc/db.py` | Shared SQLite connection helper (WAL mode + busy timeout, so the app doesn't choke if two things touch the database at once). |
 | `indycalc/data/sde.db` | The local SQLite cache -- not checked into git, rebuilt by `sde_loader.py`/`price_cache.py`. |
@@ -204,6 +205,38 @@ exactly which way each call went and why, including deep in the chain.
 The build-vs-buy comparison itself uses a quick, region-independent price estimate
 (not the same batch-optimized ore MILP used for the final purchase plan) -- see the
 simplification note below.
+
+## Using materials you already have (inventory)
+
+The "Your inventory (optional)" sidebar section lets you paste what you've already
+mined, produced, or otherwise have sitting in a hangar -- ore, minerals, components, PI
+materials, anything -- so the plan below only prices what's actually still missing,
+rather than the blueprint's full requirement from scratch.
+
+One item per line, either pasted straight from an EVE inventory/PI window's "Copy to
+Clipboard" (tab-separated, name first) or typed by hand as `Name Quantity` or
+`Name, Quantity`. Names are matched against the local SDE cache case-insensitively; a
+line that doesn't resolve to a known item or a trailing quantity is listed back as
+unmatched rather than silently ignored, so a typo doesn't just quietly vanish from the
+credited total.
+
+Two different things happen depending on what you paste:
+
+- **Ore** is reprocessed into minerals first, using the same refine %/tier settings and
+  whole-batch rule the purchase-plan MILP itself uses -- e.g. 5,000 Veldspar at a
+  100-unit portion size reprocesses as 50 whole batches, crediting the resulting
+  minerals; a partial amount short of one more full batch is left as-is (still ore in
+  your hangar, not lost, just not reprocessed yet) rather than counted as free minerals
+  it can't actually yield. Compressed ore works the same way, using its own portion size
+  and yield from the SDE.
+- **Everything else** (minerals, components, PI materials, ...) credits 1:1 against the
+  matching required material -- no conversion needed.
+
+Like every other sidebar setting, this is gated behind "Recalculate" -- pasting or
+editing inventory doesn't retrigger the buying-location comparison until you click it.
+The "Applied your inventory" table shows exactly what was credited from what (including
+reprocessing detail per ore line), and if what you pasted already covers the entire
+requirement, the app says so and stops there instead of showing an empty purchase plan.
 
 ## Building in an Engineering Complex
 
@@ -381,6 +414,9 @@ from taking several minutes on a cold cache.
 
 - Region-level price aggregation can't exclude the handful of lowsec systems inside an
   otherwise-highsec region.
+- Inventory name matching is exact (case-insensitive) against the local SDE cache, not
+  fuzzy -- a typo or an ambiguous shortened name is reported back as unmatched rather
+  than guessed at.
 - Build-vs-buy for Manufacturing products recurses to whatever depth the item's chain
   actually goes; a Reaction formula's own materials are always bought, never built (see
   above) -- there's nothing to recurse into there since reaction inputs don't have their

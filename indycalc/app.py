@@ -9,7 +9,7 @@ import time
 import pandas as pd
 import streamlit as st
 
-from indycalc import blueprint_calc, job_cost, optimizer, price_cache, production_chain
+from indycalc import blueprint_calc, inventory, job_cost, optimizer, price_cache, production_chain
 from indycalc.ore_tiers import DEFAULT_REFINE_PCT, TIERS
 from indycalc.sde_loader import DB_PATH
 
@@ -508,6 +508,22 @@ with st.sidebar:
                 key=f"refine_{tier}",
             )
 
+    st.header("Your inventory (optional)")
+    inventory_text = st.text_area(
+        "Paste what you already have -- ore, minerals, components, PI, ...",
+        value="",
+        height=120,
+        help=(
+            "One item per line. Paste straight from an EVE inventory/PI window's "
+            "\"Copy to Clipboard\" (Name, Quantity, and other columns, tab-separated) "
+            "or just type \"Name Quantity\" / \"Name, Quantity\" lines by hand. Owned "
+            "ore is reprocessed (in whole batches, at the refine % above) into "
+            "minerals first; everything else credits directly against the matching "
+            "material. Whatever's left after that is what actually gets priced below."
+        ),
+        placeholder="Tritanium 150000\nCompressed Veldspar, 4200\nRobotics 30",
+    )
+
 # Fold the Engineering Complex's structure bonus into the plain ME%/TE%
 # values from here on, rather than threading structure_me_pct etc. through
 # every downstream call -- everything below already accepts a single
@@ -551,6 +567,7 @@ live_settings = dict(
     use_station_combo=use_station_combo,
     max_stations_combo=max_stations_combo,
     refine_pct=dict(refine_pct),
+    inventory_text=inventory_text,
 )
 
 recalc_clicked = st.button("🔄 Recalculate", type="primary")
@@ -585,6 +602,7 @@ selected_station_label = committed["selected_station_label"]
 use_station_combo = committed["use_station_combo"]
 max_stations_combo = committed["max_stations_combo"]
 refine_pct = committed["refine_pct"]
+inventory_text = committed["inventory_text"]
 
 st.subheader(f"{bp_name} — ME {me_percent:.2f}% — {runs} run(s)")
 if build_structure != NO_STRUCTURE_LABEL:
@@ -616,6 +634,65 @@ req_df = pd.DataFrame(
     ]
 ).sort_values("Material")
 st.dataframe(req_df, hide_index=True, width='stretch')
+
+# Credit whatever inventory was pasted against the raw requirement above --
+# owned ore reprocesses into minerals (whole batches only, at the refine %
+# set in the sidebar), everything else (minerals/components/PI) credits
+# directly. Everything from here down (build-vs-buy, the buying-location
+# comparison, the final purchase plan) only ever sees what's left to source.
+if inventory_text.strip():
+    parsed_inventory = inventory.parse_inventory_text(inventory_text)
+    if parsed_inventory.unmatched_lines:
+        st.warning(
+            "Couldn't match these inventory lines to a known item (check spelling "
+            "against the exact in-game name) -- ignored:\n"
+            + "\n".join(f"- `{line}`" for line in parsed_inventory.unmatched_lines)
+        )
+    if parsed_inventory.owned:
+        credit = inventory.apply_inventory(required, parsed_inventory.owned, refine_pct)
+
+        credited_mat_ids = {mid for item in credit.items for mid in item.credited}
+        all_names = dict(mat_names)
+        missing_ids = (credited_mat_ids | set(credit.reduced_required)) - all_names.keys()
+        if missing_ids:
+            all_names.update(blueprint_calc.material_names(list(missing_ids)))
+
+        required = credit.reduced_required
+
+        st.subheader("Applied your inventory")
+        credit_rows = []
+        for item in credit.items:
+            if item.kind == "ore":
+                note = f"{item.batches_reprocessed} batch(es) reprocessed"
+                if item.leftover_qty:
+                    note += f", {item.leftover_qty} leftover (short of a full batch)"
+            else:
+                note = "credited directly"
+            credited_str = ", ".join(
+                f"{qty:,.0f} {all_names.get(mid, str(mid))}" for mid, qty in item.credited.items()
+            )
+            credit_rows.append(
+                {
+                    "Item": item.name,
+                    "Owned Qty": item.owned_qty,
+                    "How": note,
+                    "Credited": credited_str,
+                }
+            )
+        st.dataframe(pd.DataFrame(credit_rows), hide_index=True, width='stretch')
+
+        if not required:
+            st.success("✅ Your pasted inventory already covers everything this blueprint needs -- nothing to buy.")
+            st.stop()
+
+        remaining_df = pd.DataFrame(
+            [
+                {"Material": all_names.get(mid, str(mid)), "Still Needed": qty}
+                for mid, qty in required.items()
+            ]
+        ).sort_values("Material")
+        st.caption("Still needed after inventory:")
+        st.dataframe(remaining_df, hide_index=True, width='stretch')
 
 # The build-vs-buy decision is region-independent (see production_chain.py),
 # so it's computed once here and reused for every location comparison below
